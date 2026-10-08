@@ -824,4 +824,4 @@ test_php_stats.py
 netdisk-mcp/
 
 # 项目内置 skills(闲鱼服务操控手册,供 Agent/OpenClaw 使用)
-!skills/xianyu-auto-reply/SKILL.md
+!skills/SKILL.md
