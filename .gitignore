@@ -822,3 +822,6 @@ test_php_stats.py
 
 # 网盘入库 MCP(独立项目,单独拆走,不入本仓库)
 netdisk-mcp/
+
+# 项目内置 skills(闲鱼服务操控手册,供 Agent/OpenClaw 使用)
+!skills/xianyu-auto-reply/SKILL.md
