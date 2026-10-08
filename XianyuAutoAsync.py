@@ -15,7 +15,7 @@ from loguru import logger
 import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
-    generate_device_id, generate_sign
+    generate_device_id, generate_sign, get_stable_device_id
 )
 from config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
@@ -1968,7 +1968,7 @@ class XianyuLive:
 
         self.myid = self.cookies['unb']
         logger.info(f"【{cookie_id}】用户ID: {self.myid}")
-        self.device_id = generate_device_id(self.myid)
+        self.device_id = get_stable_device_id(self.myid)
 
         # 心跳相关配置
         self.heartbeat_interval = HEARTBEAT_INTERVAL
@@ -6694,7 +6694,7 @@ class XianyuLive:
         if new_unb and new_unb != previous_unb:
             logger.warning(f"【{self.cookie_id}】Cookie中的unb发生变化: {previous_unb} -> {new_unb} (source={source})")
             self.myid = new_unb
-            self.device_id = generate_device_id(self.myid)
+            self.device_id = get_stable_device_id(new_unb)
 
         self._sync_session_cookie_header()
         return self.cookies_str != previous_cookie_string
@@ -13657,7 +13657,9 @@ class XianyuLive:
                     await self.send_heartbeat(ws)
                     consecutive_failures = 0  # 重置失败计数
 
-                    await self._interruptible_sleep(self.heartbeat_interval)
+                    # 🔧 拟人化：心跳间隔加 ±18% 随机抖动（精确等间隔是机器人签名）
+                    jittered_interval = self.heartbeat_interval * random.uniform(0.82, 1.18)
+                    await self._interruptible_sleep(jittered_interval)
 
                 except asyncio.CancelledError:
                     # 收到取消信号，立即退出循环
@@ -16217,6 +16219,10 @@ class XianyuLive:
 
             # 如果有回复内容，发送消息
             if reply:
+                # 🔧 拟人化：发送前加 2-10 秒随机延迟（秒回+全天候秒回是行为风控画像）
+                human_delay = random.uniform(2.0, 10.0)
+                logger.debug(f"【{self.cookie_id}】拟人回复延迟: {human_delay:.1f}秒")
+                await asyncio.sleep(human_delay)
                 # 检查是否是图片发送标记
                 if reply.startswith("__IMAGE_SEND__"):
                     # 提取图片URL（关键词回复不包含卡券ID）

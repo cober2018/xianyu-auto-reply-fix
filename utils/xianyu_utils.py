@@ -1,10 +1,12 @@
 import base64
 import json
 import subprocess
+import threading
 import time
 import hashlib
 import struct
 import os
+from pathlib import Path
 from typing import Any, Dict, List
 
 import blackboxprotobuf
@@ -111,6 +113,38 @@ def generate_device_id(user_id: str) -> str:
                 result.append(chars[rand_val])
     
     return ''.join(result) + "-" + user_id
+
+
+_DEVICE_ID_LOCK = threading.Lock()
+
+
+def get_stable_device_id(user_id: str, store_path: str = "") -> str:
+    """每个用户固定一个 device_id 并持久化到本地文件。
+
+    🔧 防风控关键：device_id 若每次服务重启都随机重建，阿里风控会看到
+    「同一个用户反复换新设备」，属于强制重新登录的经典触发条件。
+    以 unb（用户ID）为键持久化，Cookie 值变化不影响设备身份。
+    """
+    user_id = str(user_id)
+    path = Path(store_path or os.getenv("XIANYU_DEVICE_ID_STORE", "data/device_ids.json"))
+    with _DEVICE_ID_LOCK:
+        try:
+            mapping = {}
+            if path.is_file():
+                mapping = json.loads(path.read_text(encoding="utf-8"))
+            device_id = mapping.get(user_id)
+            if not device_id:
+                device_id = generate_device_id(user_id)
+                mapping[user_id] = device_id
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp.replace(path)
+                logger.info(f"为用户 {user_id[:6]}*** 生成并持久化稳定 device_id")
+            return device_id
+        except Exception as e:
+            logger.warning(f"读取 device_id 持久化存储失败，回退随机生成: {e}")
+            return generate_device_id(user_id)
 
 
 def generate_sign(t: str, token: str, data: str) -> str:

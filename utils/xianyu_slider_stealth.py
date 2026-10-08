@@ -352,10 +352,10 @@ ML_STRATEGY_CONFIG = {
         # 标准策略：中等超调，模拟普通用户
         "standard": {
             "overshoot_ratio": (1.03, 1.10),   # 3-10%超调
-            "steps": (22, 35),                  # 🔧 增加步数范围
-            "base_delay": (0.006, 0.015),      # 6-15ms延迟
+            "steps": (30, 46),                  # 🔧 拟人化：增加步数，滑动更细腻
+            "base_delay": (0.014, 0.030),      # 🔧 拟人化：整体放慢（原6-15ms）
             "acceleration_curve": (1.5, 2.1),
-            "y_jitter_max": (1.2, 2.8),
+            "y_jitter_max": (2.0, 4.5),   # 🔧 拟人化：Y漂移放大到真人量级（原1.2-2.8太干净）
             "weight": 0.57,                    # 🔧 从0.47提高到0.57，吸收conservative释放的权重
         },
         # 激进策略：较大超调，模拟快速用户
@@ -6212,6 +6212,10 @@ class XianyuSliderStealth:
 
         if runtime_is_windows:
             browser_profiles = [profile for profile in browser_profiles if str(profile.get('platform')) == 'Win32']
+        else:
+            # 🔧 防风控：非 Windows 环境（macOS/Linux）只用 Mac 画像。
+            # Cookie 出生时报 Windows、日常流量却是 macOS 的跨平台矛盾是行为风控的典型特征。
+            browser_profiles = [profile for profile in browser_profiles if str(profile.get('platform')) == 'MacIntel']
 
         languages = [
             ("zh-CN", "zh-CN,zh;q=0.9,en;q=0.8"),
@@ -7492,9 +7496,19 @@ class XianyuSliderStealth:
             
             # 添加微小位移抖动（生理性颤抖，±0.5px）
             x += random.uniform(-0.5, 0.5)
-            
+
             trajectory.append((x, y, delay))
             prev_x, prev_y = x, y
+
+            # 🔧 拟人化：低概率插入 X 轴微小回退点（真人换手指发力时会倒退 1-3px，
+            # 严格单调向前的轨迹是行为风控的人体签名缺失）
+            if 0.25 < t < 0.75 and random.random() < 0.10:
+                backtrack = random.uniform(1.5, 3.5)
+                slip_x = max(1.0, x - backtrack)
+                slip_y = y + random.uniform(-0.8, 0.8)
+                slip_delay = delay * random.uniform(1.6, 2.4)  # 回拉前会下意识停一下
+                trajectory.append((slip_x, slip_y, slip_delay))
+                logger.debug(f"【{self.pure_user_id}】轨迹插入X轴回退点: {x:.1f} -> {slip_x:.1f}")
         
         # === 阶段2：回退阶段（从超调位置回退到目标） ===
         # 5-10%的回退距离
@@ -7799,11 +7813,16 @@ class XianyuSliderStealth:
                     # 🎲 延迟使用自定义波动范围
                     actual_delay = delay * random.uniform(delay_variation_min, delay_variation_max)
                     
-                    # 🎲 随机：8%概率在非首尾点增加额外停顿（模拟人类调整）
-                    if 0.15 < (i / len(trajectory)) < 0.85 and random.random() < 0.08:
-                        hesitation = random.uniform(0.01, 0.04)
+                    # 🎲 随机：拟人化中途行为——更高频的真实停顿 + 后半程减速
+                    progress_ratio = i / len(trajectory)
+                    if 0.15 < progress_ratio < 0.85 and random.random() < 0.18:
+                        # 中途"重新抓握"式停顿（原10-40ms太机械，提到120-380ms）
+                        hesitation = random.uniform(0.12, 0.38)
                         actual_delay += hesitation
                         slide_behavior[f'hesitation_at_{i}'] = hesitation
+                    if progress_ratio > 0.72:
+                        # 人类接近终点时会减速瞄准
+                        actual_delay *= random.uniform(1.5, 1.9)
                     
                     time.sleep(actual_delay)
                     
@@ -9454,14 +9473,17 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】将在主页面和所有iframe中查找（共{len(search_frames)}个frame）")
 
             # 按优先级尝试点击不同的区域
-            # 优先点击错误状态元素（"点击框体重试"），再尝试容器/包装器
+            # 🔧 拟人化修复：优先点击滑块条本体（用户观察：重试必须先点滑块条），
+            # 再依次尝试按钮、容器、错误提示区域
             click_selectors = [
+                (".nc_scale", "滑块轨道"),
+                ("#nc_1_n1z", "滑块按钮"),
+                ("#nc_1_n1t", "滑块进度条"),
+                (".nc-container", "滑块容器"),
+                (".nc_wrapper", "滑块包装器"),
                 (".errloading", "错误提示区域"),
                 (".nc-lang-cnt .errloading", "NC错误提示"),
                 ("[data-nc-status='error']", "NC错误状态元素"),
-                (".nc-container", "滑块容器"),
-                (".nc_wrapper", "滑块包装器"),
-                (".nc_scale", "滑块轨道区域"),
                 ("#baxia-dialog-content", "对话框内容"),
                 ("#nc_1__bg", "背景区域"),
                 ("div[class*='nc']", "NC相关元素"),
@@ -9478,18 +9500,29 @@ class XianyuSliderStealth:
                             try:
                                 box = element.bounding_box()
                                 if box:
-                                    click_x = box['x'] + box['width'] / 2
-                                    click_y = box['y'] + box['height'] / 2
+                                    # 🎲 拟人化：点击位置落在元素中部随机区域（±25%），
+                                    # 鼠标分2-3步移动过去，落点前短暂停顿
+                                    click_x = box['x'] + box['width'] * random.uniform(0.35, 0.65)
+                                    click_y = box['y'] + box['height'] * random.uniform(0.35, 0.65)
+                                    pre_x = click_x + random.uniform(-60, 60)
+                                    pre_y = click_y + random.uniform(-30, 30)
+                                    self.page.mouse.move(pre_x, pre_y, steps=random.randint(2, 3))
+                                    time.sleep(random.uniform(0.08, 0.22))
+                                    self.page.mouse.move(click_x, click_y, steps=random.randint(2, 4))
+                                    time.sleep(random.uniform(0.06, 0.18))
                                     self.page.mouse.click(click_x, click_y)
-                                    logger.info(f"【{self.pure_user_id}】✅ 已点击{desc}: {selector} (位置: {click_x:.1f}, {click_y:.1f})")
+                                    logger.info(
+                                        f"【{self.pure_user_id}】✅ 已拟人点击{desc}: {selector} "
+                                        f"(位置: {click_x:.1f}, {click_y:.1f})"
+                                    )
                                     clicked = True
-                                    time.sleep(0.5)
+                                    time.sleep(random.uniform(0.5, 1.0))
                                     break
                                 else:
                                     element.click(timeout=1000)
                                     logger.info(f"【{self.pure_user_id}】✅ 已点击{desc}: {selector}")
                                     clicked = True
-                                    time.sleep(0.5)
+                                    time.sleep(random.uniform(0.5, 1.0))
                                     break
                             except Exception as click_e:
                                 logger.debug(f"【{self.pure_user_id}】点击{desc} {selector} 失败: {click_e}")
@@ -9499,8 +9532,8 @@ class XianyuSliderStealth:
                         continue
             
             if clicked:
-                logger.info(f"【{self.pure_user_id}】成功点击失败提示区域，等待滑块重新加载...")
-                time.sleep(0.8)  # 等待滑块重新加载（增加等待时间）
+                logger.info(f"【{self.pure_user_id}】成功点击滑块条/提示区域，等待滑块重新加载...")
+                time.sleep(random.uniform(0.9, 1.6))  # 🎲 等待滑块重新加载（拟人化随机）
                 return True
             else:
                 logger.warning(f"【{self.pure_user_id}】未找到可点击的失败提示区域，滑块可能已存在")
