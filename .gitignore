@@ -825,3 +825,9 @@ netdisk-mcp/
 
 # 项目内置 skills(闲鱼服务操控手册,供 Agent/OpenClaw 使用)
 !skills/SKILL.md
+!listing-pipeline/README.md
+!listing-pipeline/prompts/listing.md
+
+# listing-pipeline 产物(封面图/listing JSON,按商品重新生成,不入库)
+listing-pipeline/build/
+listing-pipeline/__pycache__/
