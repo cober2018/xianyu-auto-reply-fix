@@ -82,6 +82,10 @@ RISK_CONTROL:
   token_retry_min_wait_seconds: 180
   # 拟人化：付款到自动发货之间的随机延迟区间(秒)，秒发是机器人签名
   auto_delivery_delay_range: [20, 90]
+  # 拟人化：夜间窗口内发货延迟拉长(秒)，真人卖家凌晨处理更慢
+  auto_delivery_night_delay_range: [180, 900]
+  # 拟人化：夜间窗口内自动回复延迟拉长(秒)，模拟卖家睡觉；白天 2~10 秒
+  night_reply_delay_range: [60, 480]
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟

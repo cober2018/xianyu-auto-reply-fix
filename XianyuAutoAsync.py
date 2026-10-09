@@ -749,17 +749,19 @@ class XianyuLive:
 
     def _get_effective_keepalive_interval(self) -> int:
         base_interval = max(60, int(self.session_keepalive_interval or 600))
-        if not self._is_in_night_mode_window():
-            return base_interval
-        multiplier = max(1, int(RISK_CONTROL.get('night_keepalive_multiplier', 3) or 3))
-        return base_interval * multiplier
+        if self._is_in_night_mode_window():
+            multiplier = max(1, int(RISK_CONTROL.get('night_keepalive_multiplier', 3) or 3))
+            base_interval = base_interval * multiplier
+        # 🔧 拟人化：±10% 随机抖动，精确等间隔的周期性请求是机器人签名
+        return int(base_interval * random.uniform(0.9, 1.1))
 
     def _get_effective_cookie_refresh_interval(self) -> int:
         base_interval = max(60, int(self.cookie_refresh_interval or 10800))
-        if not self._is_in_night_mode_window():
-            return base_interval
-        multiplier = max(1, int(RISK_CONTROL.get('night_cookie_refresh_multiplier', 2) or 2))
-        return base_interval * multiplier
+        if self._is_in_night_mode_window():
+            multiplier = max(1, int(RISK_CONTROL.get('night_cookie_refresh_multiplier', 2) or 2))
+            base_interval = base_interval * multiplier
+        # 🔧 拟人化：±10% 随机抖动
+        return int(base_interval * random.uniform(0.9, 1.1))
 
     def _compute_token_retry_wait_seconds(self, current_time: Optional[float] = None) -> int:
         current_time = current_time or time.time()
@@ -6193,9 +6195,13 @@ class XianyuLive:
                 # 构造用户URL
                     user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
 
-                    # 🔧 拟人化：付款后随机延迟再发货。全订单秒级发货是机器人签名，真人卖家处理订单需要时间
+                    # 🔧 拟人化：付款后随机延迟再发货。全订单秒级发货是机器人签名，真人卖家处理订单需要时间；
+                    # 夜间窗口(卖家睡觉)进一步拉长
                     try:
-                        delay_range = RISK_CONTROL.get('auto_delivery_delay_range') or [20, 90]
+                        if self._is_in_night_mode_window():
+                            delay_range = RISK_CONTROL.get('auto_delivery_night_delay_range') or [180, 900]
+                        else:
+                            delay_range = RISK_CONTROL.get('auto_delivery_delay_range') or [20, 90]
                         delivery_delay = random.uniform(float(delay_range[0]), float(delay_range[1]))
                         if delivery_delay > 0:
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 拟人发货延迟 {delivery_delay:.0f} 秒...')
@@ -16222,8 +16228,13 @@ class XianyuLive:
 
             # 如果有回复内容，发送消息
             if reply:
-                # 🔧 拟人化：发送前加 2-10 秒随机延迟（秒回+全天候秒回是行为风控画像）
-                human_delay = random.uniform(2.0, 10.0)
+                # 🔧 拟人化：发送前加随机延迟（秒回+全天候秒回是行为风控画像）。
+                # 夜间窗口(卖家睡觉)拉长到分钟级，白天 2~10 秒
+                if self._is_in_night_mode_window():
+                    night_range = RISK_CONTROL.get('night_reply_delay_range') or [60, 480]
+                    human_delay = random.uniform(float(night_range[0]), float(night_range[1]))
+                else:
+                    human_delay = random.uniform(2.0, 10.0)
                 logger.debug(f"【{self.cookie_id}】拟人回复延迟: {human_delay:.1f}秒")
                 await asyncio.sleep(human_delay)
                 # 检查是否是图片发送标记

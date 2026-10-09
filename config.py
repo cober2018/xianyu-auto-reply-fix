@@ -142,6 +142,10 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'soft_auth_token_preflight_qr_enabled': False,
     # 拟人化：付款到自动发货之间的随机延迟区间(秒)。秒发是机器人签名，真人卖家需要时间处理订单
     'auto_delivery_delay_range': [20, 90],
+    # 拟人化：夜间窗口内发货延迟拉长(秒)，真人卖家凌晨处理订单更慢；不宜过长以免影响买家体验
+    'auto_delivery_night_delay_range': [180, 900],
+    # 拟人化：夜间窗口内自动回复延迟拉长(秒)，模拟卖家睡觉；白天固定 2~10 秒
+    'night_reply_delay_range': [60, 480],
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):
