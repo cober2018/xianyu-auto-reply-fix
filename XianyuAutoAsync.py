@@ -905,7 +905,13 @@ class XianyuLive:
             return "unknown", 180
         if any(keyword in message for keyword in ["网络", "timeout", "cannot connect", "连接", "dns", "ssl"]):
             return "network", 180
-        if any(keyword in message for keyword in ["关键cookie仍未齐全", "仍缺失核心字段", "未获取到cookie"]):
+        if any(keyword in message for keyword in [
+            "关键cookie仍未齐全",
+            "仍缺失核心字段",
+            "缺少核心字段",
+            "未获取到cookie",
+            "token预检未通过",
+        ]):
             # Cookie 不齐但登录链路本身正常：明确归类，避免落入 unknown 难以排查
             return "cookie_incomplete", 300
         return "unknown", 300
@@ -7147,6 +7153,45 @@ class XianyuLive:
             'has_token_payload': bool(probe_result.get('has_token_payload')),
         }
 
+    async def _verify_new_cookie_token_usable(self, cookie_string: str) -> Tuple[bool, str]:
+        """落库前用真实 mtop token 接口验证新 Cookie 可用性。
+
+        只放行明确拿到 token 载荷的结果；结构缺失/触发验证/连续 unknown 一律拦截——
+        残缺或错误域(如 .taobao.com 域)的 _m_h5_tk 一旦落库会引发
+        "落库→实例重启→token失败→冷却→再登录" 的自激振荡，每轮都是一次完整
+        密码登录+滑块，持续累积风控。unknown 同样拦截：错域 token 在该接口上
+        的表现就是 SUCCESS 不成立。
+        """
+        from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
+        last_reason = ''
+        for attempt in range(1, 4):
+            try:
+                probe_result = await asyncio.to_thread(
+                    probe_cookie_verification_from_cookie,
+                    cookie_string,
+                    self.proxy_config,
+                    8.0,
+                )
+            except ValueError as structural_error:
+                return False, str(structural_error)
+            except Exception as probe_error:
+                last_reason = f"预检请求异常: {self._safe_str(probe_error)}"
+            else:
+                status = str(probe_result.get('status') or 'unknown')
+                if status == 'cookie_valid':
+                    return True, ''
+                if status == 'verification_required':
+                    return False, '新Cookie触发验证要求(verification_required)'
+                last_reason = f'token接口未返回有效载荷(status={status})'
+            if attempt < 3:
+                wait_secs = 2.0 * attempt
+                logger.warning(
+                    f"【{self.cookie_id}】落库前Token预检第{attempt}次未通过({last_reason})，"
+                    f"{wait_secs:.0f}秒后重试(Cookie可能尚未在服务端生效)"
+                )
+                await asyncio.sleep(wait_secs)
+        return False, last_reason or 'token预检失败'
+
     async def preflight_token_after_manual_refresh(self) -> str:
         """手动刷新成功后的 token 预检，确认新实例可直接完成初始化。
 
@@ -8754,7 +8799,45 @@ class XianyuLive:
                 # 将cookie字典转换为字符串格式
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
                 logger.info(f"【{self.cookie_id}】Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
-                
+
+                # 🔒 落库前硬闸门：结构校验 + 真实 token 预检。
+                # 残缺(缺 _m_h5_tk 等)或错域的 Cookie 落库会触发 CookieManager
+                # 立即重启实例，新实例 token 必然失败，再走 59 秒冷静期→再次完整
+                # 密码登录，形成每分钟一次登录+滑块的自激振荡(2026-10-09 生产实测)。
+                gate_missing_fields = [
+                    key for key in REQUIRED_SESSION_COOKIE_FIELDS
+                    if not str(result.get(key) or '').strip()
+                ]
+                gate_error = ''
+                if gate_missing_fields:
+                    gate_error = f"密码登录Cookie缺少核心字段: {', '.join(gate_missing_fields)}"
+                else:
+                    token_usable, token_reason = await self._verify_new_cookie_token_usable(new_cookies_str)
+                    if not token_usable:
+                        gate_error = f"密码登录后Token预检未通过: {token_reason or '未知原因'}"
+
+                if gate_error:
+                    logger.error(f"【{self.cookie_id}】❌ {gate_error}，拒绝落库并进入退避(阻断重启自激振荡)")
+                    XianyuLive.set_password_login_failure_backoff('cookie_incomplete', 300)
+                    self.last_token_refresh_status = 'cookie_incomplete'
+                    self.last_token_refresh_error_message = gate_error
+                    await self.send_token_refresh_notification(
+                        f"密码登录成功但{gate_error}，已拒绝落库防止重启循环，300秒后重试",
+                        "token_refresh"
+                    )
+                    if refresh_risk_log_id:
+                        self._update_risk_log(
+                            refresh_risk_log_id,
+                            session_id=risk_session_id,
+                            trigger_scene=trigger_scene,
+                            result_code='cookie_incomplete',
+                            processing_status='failed',
+                            error_message=gate_error,
+                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
+                        )
+                    return False
+
                 # 记录密码登录时间，防止重复登录
                 XianyuLive._last_password_login_time[self.cookie_id] = time.time()
                 logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
