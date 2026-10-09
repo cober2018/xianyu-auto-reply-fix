@@ -710,9 +710,11 @@ class XianyuLive:
                 return RISK_CONTROL.get(config_key, config.get(f'RISK_CONTROL.{config_key}', default))
             return raw_value
 
-        enabled_raw = _setting_value('risk_control_night_mode_enabled', 'night_mode_enabled', False)
-        start_raw = _setting_value('risk_control_night_start_hour', 'night_start_hour', 1)
-        end_raw = _setting_value('risk_control_night_end_hour', 'night_end_hour', 6)
+        # 默认开启夜间模式(0-7点)：夜间回复/发货延迟与保活降频依赖此开关，
+        # 新环境零配置即生效；数据库/配置里显式写 false 仍可关闭
+        enabled_raw = _setting_value('risk_control_night_mode_enabled', 'night_mode_enabled', True)
+        start_raw = _setting_value('risk_control_night_start_hour', 'night_start_hour', 0)
+        end_raw = _setting_value('risk_control_night_end_hour', 'night_end_hour', 7)
 
         def _to_bool(value: Any, default: bool = False) -> bool:
             if isinstance(value, bool):
@@ -728,9 +730,9 @@ class XianyuLive:
                 return default
 
         return {
-            'enabled': _to_bool(enabled_raw, False),
-            'start_hour': _to_hour(start_raw, 1),
-            'end_hour': _to_hour(end_raw, 6),
+            'enabled': _to_bool(enabled_raw, True),
+            'start_hour': _to_hour(start_raw, 0),
+            'end_hour': _to_hour(end_raw, 7),
         }
 
     def _is_in_night_mode_window(self, local_hour: Optional[int] = None) -> bool:
