@@ -22,6 +22,8 @@ import socket
 import signal
 from datetime import datetime
 from urllib.parse import parse_qs, quote_plus, urlencode, urlparse
+
+from utils.xianyu_utils import build_runtime_chrome_ua, get_runtime_platform_fingerprint
 from playwright.sync_api import sync_playwright as playwright_sync_playwright, ElementHandle
 try:
     from patchright.sync_api import sync_playwright as patchright_sync_playwright
@@ -164,15 +166,11 @@ def probe_cookie_verification_from_cookie(
         "referer": "https://www.goofish.com/",
         "sec-ch-ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform": get_runtime_platform_fingerprint()['sec_ch_ua_platform'],
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/133.0.0.0 Safari/537.36"
-        ),
+        "user-agent": build_runtime_chrome_ua("133.0.0.0"),
     })
     session.cookies.update(cookies)
 
@@ -2142,10 +2140,11 @@ class XianyuSliderStealth:
 
     def _apply_runtime_browser_profile(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
         features = dict(browser_features)
+        platform_fp = get_runtime_platform_fingerprint()
 
-        if os.name == 'nt':
-            features['platform'] = 'Win32'
-            features['timezone_id'] = 'Asia/Shanghai'
+        # 平台字段与真实运行平台强一致；画像筛选层已按平台过滤，这里兜底统一 UA/平台，防跨平台矛盾指纹
+        features['platform'] = platform_fp['navigator_platform']
+        features['timezone_id'] = 'Asia/Shanghai'
 
         local_browser_info = getattr(self, "local_browser_info", None) or {}
         full_version = str(local_browser_info.get("version") or "").strip()
@@ -2160,24 +2159,11 @@ class XianyuSliderStealth:
             return features
 
         browser_family = self._get_browser_family()
-        if browser_family == "edge":
-            features['user_agent'] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{full_version} Safari/537.36 Edg/{full_version}"
-            )
-            features['profile_id'] = (
-                f"win_edge_{major_version}_{features.get('viewport_width', 1600)}x"
-                f"{features.get('viewport_height', 900)}"
-            )
-        else:
-            features['user_agent'] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{full_version} Safari/537.36"
-            )
-            features['profile_id'] = (
-                f"win_chrome_{major_version}_{features.get('viewport_width', 1600)}x"
-                f"{features.get('viewport_height', 900)}"
-            )
+        features['user_agent'] = build_runtime_chrome_ua(full_version, browser_family)
+        features['profile_id'] = (
+            f"{platform_fp['profile_prefix']}_{browser_family}_{major_version}_"
+            f"{features.get('viewport_width', 1600)}x{features.get('viewport_height', 900)}"
+        )
 
         features['browser_version'] = full_version
         features['browser_major_version'] = major_version

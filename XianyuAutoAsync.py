@@ -15,7 +15,8 @@ from loguru import logger
 import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
-    generate_device_id, generate_sign, get_stable_device_id
+    generate_device_id, generate_sign, get_stable_device_id,
+    build_runtime_chrome_ua
 )
 from config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
@@ -7294,11 +7295,7 @@ class XianyuLive:
             logger.debug(f"读取本机浏览器版本失败，使用兼容 UA: {identity_error}")
 
         major_version = full_version.split('.', 1)[0]
-        edge_suffix = f' Edg/{full_version}' if browser_family == 'edge' else ''
-        user_agent = (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-            f'(KHTML, like Gecko) Chrome/{full_version} Safari/537.36{edge_suffix}'
-        )
+        user_agent = build_runtime_chrome_ua(full_version, browser_family)
         brand_name = 'Microsoft Edge' if browser_family == 'edge' else 'Google Chrome'
         sec_ch_ua = (
             f'"{brand_name}";v="{major_version}", "Chromium";v="{major_version}", '
@@ -9011,7 +9008,7 @@ class XianyuLive:
                 headers={
                     'cookie': self.cookies_str,
                     'Referer': 'https://www.goofish.com/',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'User-Agent': build_runtime_chrome_ua('120.0.0.0'),
                 },
                 allow_redirects=True
             ) as response:
@@ -14163,7 +14160,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                'user_agent': build_runtime_chrome_ua('138.0.0.0')
             }
 
             # 使用标准窗口大小
@@ -14554,7 +14551,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                'user_agent': build_runtime_chrome_ua('138.0.0.0')
             }
 
             # 使用标准窗口大小
@@ -14843,7 +14840,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                'user_agent': build_runtime_chrome_ua('138.0.0.0')
             }
 
             # 使用标准窗口大小

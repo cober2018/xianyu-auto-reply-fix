@@ -1,6 +1,7 @@
 import base64
 import json
 import subprocess
+import sys
 import threading
 import time
 import hashlib
@@ -151,11 +152,49 @@ def generate_sign(t: str, token: str, data: str) -> str:
     """生成签名"""
     app_key = "34839810"
     msg = f"{token}&{t}&{app_key}&{data}"
-    
+
     # 使用MD5生成签名
     md5_hash = hashlib.md5()
     md5_hash.update(msg.encode('utf-8'))
     return md5_hash.hexdigest()
+
+
+def get_runtime_platform_fingerprint() -> Dict[str, str]:
+    """真实运行平台的指纹要素。
+
+    UA 声称的系统与 navigator.platform 不一致是典型指纹矛盾点，比单字段造假更容易被风控识别；
+    浏览器画像只允许在真实平台内随机化，不允许跨平台伪装。
+    """
+    if os.name == 'nt':
+        return {
+            'ua_platform': 'Windows NT 10.0; Win64; x64',
+            'navigator_platform': 'Win32',
+            'sec_ch_ua_platform': '"Windows"',
+            'profile_prefix': 'win',
+        }
+    if sys.platform == 'darwin':
+        # Chrome UA reduction 将 macOS 版本统一冻结在 10_15_7，与本机大版本无关
+        return {
+            'ua_platform': 'Macintosh; Intel Mac OS X 10_15_7',
+            'navigator_platform': 'MacIntel',
+            'sec_ch_ua_platform': '"macOS"',
+            'profile_prefix': 'mac',
+        }
+    return {
+        'ua_platform': 'X11; Linux x86_64',
+        'navigator_platform': 'Linux x86_64',
+        'sec_ch_ua_platform': '"Linux"',
+        'profile_prefix': 'linux',
+    }
+
+
+def build_runtime_chrome_ua(version: str = '138.0.0.0', family: str = 'chrome') -> str:
+    """按真实运行平台生成 Chrome UA；family 传 'edge' 时带 Edg 后缀。"""
+    suffix = f' Edg/{version}' if family == 'edge' else ''
+    return (
+        f"Mozilla/5.0 ({get_runtime_platform_fingerprint()['ua_platform']}) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36{suffix}"
+    )
 
 
 class MessagePackDecoder:
