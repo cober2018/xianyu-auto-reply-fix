@@ -25,7 +25,7 @@ _HERE = Path(__file__).resolve().parent
 _MTOP_HEADERS = {
     'User-Agent':         UA,
     'Accept':             'application/json',
-    'Accept-Language':    'en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6',
+    'Accept-Language':    'zh-CN,zh;q=0.9,en;q=0.8',
     'Accept-Encoding':    'gzip, deflate, br, zstd',
     'sec-ch-ua':          _BROWSER_IDENTITY['sec_ch_ua'],
     'sec-ch-ua-mobile':   '?0',
@@ -61,7 +61,7 @@ def build_initial_session(*, with_tfstk: bool = True, proxies=None) -> requests.
     s = requests.Session()
     if proxies:
         s.proxies.update(proxies)
-    s.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9'})
+    s.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
 
     # 1) cna —— mmstat 链路
     s.get('https://log.mmstat.com/eg.js', timeout=10)

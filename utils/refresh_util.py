@@ -1745,7 +1745,7 @@ class XianyuApis:
         self.session = requests.Session()
         self.session.headers.update({
             'accept': 'application/json',
-            'accept-language': 'zh-CN,zh;q=0.9',
+            'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'cache-control': 'no-cache',
             'origin': 'https://www.goofish.com',
             'pragma': 'no-cache',

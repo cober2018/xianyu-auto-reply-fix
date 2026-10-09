@@ -40,7 +40,7 @@ _BROWSER_IDENTITY = get_consistent_browser_identity()
 _PASSPORT_HEADERS = {
     "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br, zstd",
     "sec-ch-ua": _BROWSER_IDENTITY['sec_ch_ua'],
     "sec-ch-ua-mobile": "?0",

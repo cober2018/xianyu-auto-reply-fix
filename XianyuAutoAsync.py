@@ -1769,17 +1769,20 @@ class XianyuLive:
         if getattr(self, 'last_token_refresh_status', None) in {"password_login_backoff_wait", "verification_pending_manual", "qr_login_grace_wait"}:
             return max(60, self._compute_token_retry_wait_seconds(current_time))
 
+        # 🔧 拟人化：退避时长加 ±25% 随机抖动，等间隔重连列车是机器人签名
+        jitter = random.uniform(0.75, 1.25)
+
         # WebSocket意外断开 - 短延迟
         if "no close frame received or sent" in error_msg:
-            return min(3 * self.connection_failures, 15)
-        
+            return int(min(3 * self.connection_failures, 15) * jitter)
+
         # 网络连接问题 - 长延迟
         elif "Connection refused" in error_msg or "timeout" in error_msg.lower():
-            return min(10 * self.connection_failures, 60)
-        
+            return int(min(10 * self.connection_failures, 60) * jitter)
+
         # 其他未知错误 - 中等延迟
         else:
-            return min(5 * self.connection_failures, 30)
+            return int(min(5 * self.connection_failures, 30) * jitter)
 
     def _cleanup_instance_caches(self):
         """清理实例级别的缓存，防止内存泄漏"""
@@ -6188,7 +6191,17 @@ class XianyuLive:
                     return
 
                 # 构造用户URL
-                user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
+                    user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
+
+                    # 🔧 拟人化：付款后随机延迟再发货。全订单秒级发货是机器人签名，真人卖家处理订单需要时间
+                    try:
+                        delay_range = RISK_CONTROL.get('auto_delivery_delay_range') or [20, 90]
+                        delivery_delay = random.uniform(float(delay_range[0]), float(delay_range[1]))
+                        if delivery_delay > 0:
+                            logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 拟人发货延迟 {delivery_delay:.0f} 秒...')
+                            await asyncio.sleep(delivery_delay)
+                    except Exception as delay_error:
+                        logger.debug(f"发货延迟配置无效，按无延迟处理: {self._safe_str(delay_error)}")
 
                 # 自动发货逻辑
                 try:
@@ -10006,7 +10019,7 @@ class XianyuLive:
             if not item_reply or not item_reply.get('reply_content'):
                 return None
 
-            reply_content = item_reply['reply_content']
+            reply_content = self._pick_reply_variant(item_reply['reply_content'])
             logger.info(f"【{self.cookie_id}】使用指定商品回复: 商品ID={item_id}")
 
             try:
@@ -10045,7 +10058,7 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】chat_id {chat_id} 已使用过默认回复，跳过（只回复一次）")
                     return "SKIP_REPLY"
 
-            reply_content = default_reply_settings.get('reply_content', '')
+            reply_content = self._pick_reply_variant(default_reply_settings.get('reply_content', ''))
             if not reply_content or (reply_content and reply_content.strip() == ''):
                 logger.info(f"账号 {self.cookie_id} 默认回复内容为空，不进行回复")
                 return "EMPTY_REPLY"  # 返回特殊标记表示不回复
@@ -10074,6 +10087,18 @@ class XianyuLive:
             logger.error(f"获取默认回复失败: {self._safe_str(e)}")
             return None
 
+    @staticmethod
+    def _pick_reply_variant(reply_content: str) -> str:
+        """多词条拟人化：回复内容用 || 分隔多条候选时随机选一条；单条行为不变。
+
+        每个买家收到字节级相同的回复是典型的机器人特征（买家对比聊天记录即可举报），
+        运营可在关键词/默认/指定商品回复里配置「词条A||词条B||词条C」实现随机化。
+        """
+        if not reply_content or '||' not in reply_content:
+            return reply_content
+        variants = [part.strip() for part in reply_content.split('||') if part.strip()]
+        return random.choice(variants) if variants else reply_content
+
     async def get_keyword_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None) -> str:
         """获取关键词匹配回复（支持商品ID优先匹配和图片类型）"""
         try:
@@ -10090,7 +10115,7 @@ class XianyuLive:
             if item_id:
                 for keyword_data in keywords:
                     keyword = keyword_data['keyword']
-                    reply = keyword_data['reply']
+                    reply = self._pick_reply_variant(keyword_data['reply'])
                     keyword_item_id = keyword_data['item_id']
                     keyword_type = keyword_data.get('type', 'text')
                     image_url = keyword_data.get('image_url')
@@ -10125,7 +10150,7 @@ class XianyuLive:
             # 2. 如果商品ID匹配失败或没有商品ID，匹配没有商品ID的通用关键词
             for keyword_data in keywords:
                 keyword = keyword_data['keyword']
-                reply = keyword_data['reply']
+                reply = self._pick_reply_variant(keyword_data['reply'])
                 keyword_item_id = keyword_data['item_id']
                 keyword_type = keyword_data.get('type', 'text')
                 image_url = keyword_data.get('image_url')
