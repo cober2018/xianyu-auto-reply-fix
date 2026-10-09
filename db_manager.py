@@ -332,7 +332,7 @@ class DBManager:
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
-                show_browser INTEGER DEFAULT 1,  # 默认有头登录(防风控)：无显示器的服务器环境自动回退无头
+                show_browser INTEGER DEFAULT 1,  -- 默认有头登录(防风控)：无显示器的服务器环境自动回退无头
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )

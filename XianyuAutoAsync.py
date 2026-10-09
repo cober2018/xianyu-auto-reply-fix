@@ -905,6 +905,9 @@ class XianyuLive:
             return "unknown", 180
         if any(keyword in message for keyword in ["网络", "timeout", "cannot connect", "连接", "dns", "ssl"]):
             return "network", 180
+        if any(keyword in message for keyword in ["关键cookie仍未齐全", "仍缺失核心字段", "未获取到cookie"]):
+            # Cookie 不齐但登录链路本身正常：明确归类，避免落入 unknown 难以排查
+            return "cookie_incomplete", 300
         return "unknown", 300
 
     @staticmethod

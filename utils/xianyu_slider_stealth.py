@@ -3640,8 +3640,10 @@ class XianyuSliderStealth:
         '_m_h5_tk_enc',
         't',
         'cna',
-        'havana_lgc2_77',
         '_tb_token_',
+        # havana_lgc2_77 已移除：阿里新登录链路不再稳定下发该字段（2026-10 实测
+        # 密码登录成功后 31 字段中无此键），保留在保护清单会把成功登录误判失败。
+        # 硬性门槛以 _REQUIRED_SESSION_COOKIE_FIELDS 为准。
     )
     _REQUIRED_SESSION_COOKIE_FIELDS = (
         'unb',
@@ -3830,9 +3832,6 @@ class XianyuSliderStealth:
             if cookies_dict.get(key)
         ]
         if not pending_markers:
-            return []
-
-        if cookies_dict.get('havana_lgc2_77'):
             return []
 
         missing_required_fields = [
@@ -4337,7 +4336,13 @@ class XianyuSliderStealth:
             if not best_missing:
                 break
 
-        if best_cookies.get('havana_lgc2_77'):
+        # 核心会话字段齐全即视为登录态完成，清除预热阶段残留的验证提示；
+        # 不再以单个可选字段(havana_lgc2_77 等)作为完成信号
+        best_missing_required = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not best_cookies.get(key)
+        ]
+        if not best_missing_required:
             self.last_browser_cookie_warmup_verification_hint = None
 
         return best_cookies
@@ -4569,12 +4574,17 @@ class XianyuSliderStealth:
         if not verification_url or not context:
             return None
 
-        if cookies_dict.get('havana_lgc2_77'):
+        # 核心会话字段齐全说明登录态有效，验证提示视为过期噪音，不再接管
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if not missing_required_fields:
             return None
 
         logger.warning(
             f"【{self.pure_user_id}】检测到浏览器业务预热返回后续验证入口，"
-            f"当前 havana_lgc2_77 仍缺失，转入验证接管: {verification_url}"
+            f"当前核心会话Cookie仍缺失({missing_required_fields})，转入验证接管: {verification_url}"
         )
 
         verify_page = None
