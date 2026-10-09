@@ -332,7 +332,7 @@ class DBManager:
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
-                show_browser INTEGER DEFAULT 0,
+                show_browser INTEGER DEFAULT 1,  # 默认有头登录(防风控)：无显示器的服务器环境自动回退无头
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -1913,7 +1913,7 @@ Cookie数量: {cookie_count}
                 logger.info("cookies表show_browser字段已存在")
             except sqlite3.OperationalError:
                 # show_browser字段不存在，需要添加
-                self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN show_browser INTEGER DEFAULT 0")
+                self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN show_browser INTEGER DEFAULT 1")
                 logger.info("为cookies表添加show_browser字段")
 
             logger.info("✅ cookies表账号登录字段升级完成")

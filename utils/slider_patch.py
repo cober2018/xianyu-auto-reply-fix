@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import time
 import random
 
-from utils.xianyu_utils import get_consistent_browser_identity
+from utils.xianyu_utils import get_consistent_browser_identity, resolve_headless_flag
 
 
 def send_notification(user_id: str, title: str, message: str, notification_type: str = "info"):
@@ -1650,7 +1650,7 @@ def patch_login_with_password_headful():
                     # 启动浏览器（使用持久化上下文）
                     context = playwright.chromium.launch_persistent_context(
                         user_data_dir,  # 第一个参数就是用户数据目录
-                        headless=not show_browser,
+                        headless=resolve_headless_flag(show_browser),
                         args=browser_args,
                         viewport={'width': 1980, 'height': 1024},
                         user_agent=get_consistent_browser_identity()['user_agent'],

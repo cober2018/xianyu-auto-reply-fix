@@ -263,6 +263,19 @@ def _detect_local_chrome() -> Dict[str, Any]:
     return result
 
 
+def resolve_headless_flag(show_browser: bool) -> bool:
+    """有头登录开关的安全解析：请求有头但环境无显示器时自动回退无头。
+
+    show_browser 默认开启(防风控，真窗口指纹远好于无头)；macOS/Windows 始终可开窗，
+    Linux 仅在 DISPLAY 存在(如 xvfb)时开窗，否则回退无头避免启动失败。
+    """
+    if not show_browser:
+        return True
+    if os.name == 'nt' or sys.platform == 'darwin':
+        return False
+    return not bool(os.environ.get('DISPLAY'))
+
+
 def get_consistent_browser_identity() -> Dict[str, str]:
     """所有 HTTP 侧 UA / sec-ch-ua / sec-ch-ua-platform 的统一出口。
 

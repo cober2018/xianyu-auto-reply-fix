@@ -33,7 +33,7 @@ from blacklist_service import blacklist_service
 from message_filter_service import message_filter_service
 from utils.qr_login import qr_login_manager
 from utils.qr_login_lite import qrcode_login_lite
-from utils.xianyu_utils import trans_cookies
+from utils.xianyu_utils import trans_cookies, resolve_headless_flag
 from utils.image_utils import image_manager
 from utils.item_pagination import MAX_ITEM_LIST_PAGE_SIZE
 from utils.product_sku import ProductSkuValidationError, normalize_sku_config
@@ -5409,7 +5409,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=not show_browser,
+            headless=resolve_headless_flag(show_browser),
             initial_cookies=existing_cookie_info.get('value', ''),
             proxy=proxy_config,
         )
@@ -5938,7 +5938,7 @@ async def _execute_manual_cookie_import(
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=not show_browser,
+            headless=resolve_headless_flag(show_browser),
             initial_cookies=cookie_value,
             proxy=proxy_config,
         )

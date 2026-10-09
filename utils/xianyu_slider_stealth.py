@@ -1657,10 +1657,46 @@ class XianyuSliderStealth:
         return False, ""
 
     def _detect_local_browser_info(self) -> Dict[str, Any]:
-        if os.name != 'nt':
-            return {}
-
         browser_candidates = [
+            # macOS:真 Chrome/Edge 位于 /Applications,探测到即绑定,
+            # 否则回落到无头捆绑 Chromium(作者原实现只有 Windows 路径)
+            {
+                "family": "chrome",
+                "channel": "chrome",
+                "path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            },
+            {
+                "family": "edge",
+                "channel": "msedge",
+                "path": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            },
+            {
+                "family": "chrome",
+                "channel": "chrome",
+                "path": "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            },
+            # Linux
+            {
+                "family": "chrome",
+                "channel": "chrome",
+                "path": "/usr/bin/google-chrome",
+            },
+            {
+                "family": "chrome",
+                "channel": "chrome",
+                "path": "/usr/bin/google-chrome-stable",
+            },
+            {
+                "family": "edge",
+                "channel": "msedge",
+                "path": "/usr/bin/microsoft-edge",
+            },
+            {
+                "family": "chrome",
+                "channel": "chrome",
+                "path": "/usr/bin/chromium-browser",
+            },
+            # Windows
             {
                 "family": "edge",
                 "channel": "msedge",
@@ -1895,7 +1931,7 @@ class XianyuSliderStealth:
         try:
             output = subprocess.check_output(
                 [browser_path, "--version"],
-                timeout=3,
+                timeout=8,
                 encoding="utf-8",
                 errors="ignore",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

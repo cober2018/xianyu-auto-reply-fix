@@ -16,7 +16,7 @@ import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
     generate_device_id, generate_sign, get_stable_device_id,
-    get_consistent_browser_identity
+    get_consistent_browser_identity, resolve_headless_flag
 )
 from config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
@@ -8070,7 +8070,7 @@ class XianyuLive:
                 slider_stealth = XianyuSliderStealth(
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=not show_browser,
+                    headless=resolve_headless_flag(show_browser),
                     initial_cookies=self.cookies_str,
                     proxy=self.proxy_config,
                     use_account_persistent_profile=True,
@@ -8710,7 +8710,7 @@ class XianyuLive:
             
             # 在单独的线程中运行同步的登录方法
             import asyncio
-            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=True, headless=not show_browser)
+            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=True, headless=resolve_headless_flag(show_browser))
             slider.risk_session_id = risk_session_id
             slider.risk_trigger_scene = trigger_scene
             result = await slider._run_sync_method_on_fresh_thread(
@@ -14559,7 +14559,7 @@ class XianyuLive:
             account_info = db_manager.get_cookie_details(self.cookie_id) or {}
             show_browser = bool(account_info.get('show_browser', False))
             browser = await playwright.chromium.launch(
-                headless=not show_browser,
+                headless=resolve_headless_flag(show_browser),
                 args=browser_args
             )
 
@@ -14848,7 +14848,7 @@ class XianyuLive:
             account_info = db_manager.get_cookie_details(self.cookie_id) or {}
             show_browser = bool(account_info.get('show_browser', False))
             browser = await playwright.chromium.launch(
-                headless=not show_browser,
+                headless=resolve_headless_flag(show_browser),
                 args=browser_args
             )
 
