@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -171,20 +172,34 @@ def get_runtime_platform_fingerprint() -> Dict[str, str]:
             'navigator_platform': 'Win32',
             'sec_ch_ua_platform': '"Windows"',
             'profile_prefix': 'win',
+            'ua_ch_platform_version': '19.0.0',
+            'ua_ch_architecture': 'x86',
+            'ua_ch_bitness': '64',
         }
     if sys.platform == 'darwin':
         # Chrome UA reduction 将 macOS 版本统一冻结在 10_15_7，与本机大版本无关
+        try:
+            machine = (os.uname().machine or '').lower()
+        except Exception:
+            machine = 'x86_64'
         return {
             'ua_platform': 'Macintosh; Intel Mac OS X 10_15_7',
             'navigator_platform': 'MacIntel',
             'sec_ch_ua_platform': '"macOS"',
             'profile_prefix': 'mac',
+            'ua_ch_platform_version': '10.15.7',
+            # Apple Silicon 上真实 Chrome 报 arm + MacIntel(兼容保留),x86 机型报 x86
+            'ua_ch_architecture': 'arm' if 'arm' in machine else 'x86',
+            'ua_ch_bitness': '64',
         }
     return {
         'ua_platform': 'X11; Linux x86_64',
         'navigator_platform': 'Linux x86_64',
         'sec_ch_ua_platform': '"Linux"',
         'profile_prefix': 'linux',
+        'ua_ch_platform_version': '6.8.0',
+        'ua_ch_architecture': 'x86',
+        'ua_ch_bitness': '64',
     }
 
 
@@ -195,6 +210,78 @@ def build_runtime_chrome_ua(version: str = '138.0.0.0', family: str = 'chrome') 
         f"Mozilla/5.0 ({get_runtime_platform_fingerprint()['ua_platform']}) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36{suffix}"
     )
+
+
+_LOCAL_BROWSER_CACHE: Dict[str, Any] = {}
+
+
+def _detect_local_chrome() -> Dict[str, Any]:
+    """探测本机真实 Chrome/Edge 版本(带缓存),失败返回空版本走兼容默认值。"""
+    if 'result' in _LOCAL_BROWSER_CACHE:
+        return _LOCAL_BROWSER_CACHE['result']
+
+    if sys.platform == 'darwin':
+        candidates = [
+            ('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', 'chrome'),
+            ('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', 'edge'),
+            ('/Applications/Chromium.app/Contents/MacOS/Chromium', 'chrome'),
+        ]
+    elif os.name == 'nt':
+        candidates = []
+        for env_dir in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA'):
+            base = os.getenv(env_dir, '')
+            if base:
+                candidates.append((os.path.join(base, 'Google', 'Chrome', 'Application', 'chrome.exe'), 'chrome'))
+                candidates.append((os.path.join(base, 'Microsoft', 'Edge', 'Application', 'msedge.exe'), 'edge'))
+    else:
+        candidates = [
+            ('/usr/bin/google-chrome', 'chrome'),
+            ('/usr/bin/google-chrome-stable', 'chrome'),
+            ('/usr/bin/microsoft-edge', 'edge'),
+            ('/usr/bin/chromium-browser', 'chrome'),
+            ('/usr/bin/chromium', 'chrome'),
+        ]
+
+    result = {'version': '', 'family': 'chrome'}
+    for browser_path, family in candidates:
+        if not browser_path or not os.path.exists(browser_path):
+            continue
+        try:
+            output = subprocess.check_output(
+                [browser_path, '--version'],
+                timeout=8, encoding='utf-8', errors='ignore',
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            match = re.search(r'(\d+\.\d+\.\d+\.\d+)', output or '')
+            if match:
+                result = {'version': match.group(1), 'family': family}
+                break
+        except Exception:
+            continue
+
+    _LOCAL_BROWSER_CACHE['result'] = result
+    return result
+
+
+def get_consistent_browser_identity() -> Dict[str, str]:
+    """所有 HTTP 侧 UA / sec-ch-ua / sec-ch-ua-platform 的统一出口。
+
+    平台跟随真实运行系统、版本跟随本机真实 Chrome,保证与随后处理登录/验证的
+    浏览器指纹完全一致;同一账号的所有出站请求呈现同一个浏览器身份。
+    """
+    info = _detect_local_chrome()
+    version = info['version'] or '138.0.0.0'
+    family = info['family']
+    major_version = version.split('.', 1)[0]
+    brand_name = 'Microsoft Edge' if family == 'edge' else 'Google Chrome'
+    return {
+        'user_agent': build_runtime_chrome_ua(version, family),
+        'sec_ch_ua': (
+            f'"{brand_name}";v="{major_version}", "Chromium";v="{major_version}", '
+            '"Not_A Brand";v="24"'
+        ),
+        'sec_ch_ua_platform': get_runtime_platform_fingerprint()['sec_ch_ua_platform'],
+    }
 
 
 class MessagePackDecoder:

@@ -17,6 +17,8 @@ from typing import Any, Dict, Tuple
 import aiohttp
 from loguru import logger
 
+from utils.xianyu_utils import get_consistent_browser_identity
+
 
 APP_KEY = "34839810"
 RATE_API_URL = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.rate.create/4.0/"
@@ -165,7 +167,7 @@ class RateService:
         headers = {
             "accept": "application/json",
             "content-type": "application/x-www-form-urlencoded",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "user-agent": get_consistent_browser_identity()['user_agent'],
             "referer": "https://www.goofish.com/",
             "origin": "https://www.goofish.com",
             "cookie": self.cookie_string,
@@ -286,7 +288,7 @@ async def fetch_merchant_rate_list(
         headers = {
             "accept": "application/json",
             "content-type": "application/x-www-form-urlencoded",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "user-agent": get_consistent_browser_identity()['user_agent'],
             "referer": "https://seller.goofish.com/?site=COMMONPRO",
             "origin": "https://seller.goofish.com",
             "cookie": current_cookie,

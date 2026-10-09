@@ -7,7 +7,7 @@ from loguru import logger
 
 from utils.order_detail_fetcher import OrderDetailFetcher
 from utils.time_utils import parse_db_timestamp, parse_local_datetime_text_to_db_utc
-from utils.xianyu_utils import generate_sign, trans_cookies
+from utils.xianyu_utils import generate_sign, trans_cookies, get_consistent_browser_identity
 
 
 ORDER_LIST_API_URL = 'https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/'
@@ -275,11 +275,7 @@ class OrderHistoryPageFetcher:
             'idle_user_group_member_id': '',
             'origin': 'https://seller.goofish.com',
             'referer': ORDER_LIST_REFERER,
-            'user-agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/138.0.0.0 Safari/537.36'
-            ),
+            'user-agent': get_consistent_browser_identity()['user_agent'],
         }
 
     def _build_request_params(self, data_val: str) -> Dict[str, str]:

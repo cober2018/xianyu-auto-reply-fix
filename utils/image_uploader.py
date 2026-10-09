@@ -11,6 +11,8 @@ from loguru import logger
 from PIL import Image
 import io
 
+from utils.xianyu_utils import get_consistent_browser_identity
+
 
 class ImageUploader:
     """图片上传器 - 上传图片到闲鱼CDN"""
@@ -37,7 +39,7 @@ class ImageUploader:
                 connector=connector,
                 timeout=timeout,
                 headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    'User-Agent': get_consistent_browser_identity()['user_agent']
                 }
             )
     
@@ -128,7 +130,7 @@ class ImageUploader:
             headers = {
                 'cookie': self.cookies_str,
                 'Referer': 'https://www.goofish.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': get_consistent_browser_identity()['user_agent'],
                 'x-requested-with': 'XMLHttpRequest',
                 'Accept': 'application/json, text/javascript, */*; q=0.01',
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',

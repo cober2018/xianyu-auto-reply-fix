@@ -17,6 +17,8 @@ from typing import Any, Dict, Tuple
 import aiohttp
 from loguru import logger
 
+from utils.xianyu_utils import get_consistent_browser_identity
+
 
 APP_KEY = "34839810"
 RED_FLOWER_API_URL = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.red.flower/1.0/"
@@ -154,7 +156,7 @@ class RedFlowerService:
         headers = {
             "accept": "application/json",
             "content-type": "application/x-www-form-urlencoded",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "user-agent": get_consistent_browser_identity()['user_agent'],
             "referer": "https://www.goofish.com/",
             "origin": "https://www.goofish.com",
             "cookie": self.cookie_string,

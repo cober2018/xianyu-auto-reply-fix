@@ -13,8 +13,11 @@ from pathlib import Path
 
 import requests
 
-UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36')
+from utils.xianyu_utils import get_consistent_browser_identity
+
+# ── 浏览器身份:平台/版本跟随本机真实 Chrome,与扫码后的浏览器指纹一致 ──
+_BROWSER_IDENTITY = get_consistent_browser_identity()
+UA = _BROWSER_IDENTITY['user_agent']
 
 _HERE = Path(__file__).resolve().parent
 
@@ -24,9 +27,9 @@ _MTOP_HEADERS = {
     'Accept':             'application/json',
     'Accept-Language':    'en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6',
     'Accept-Encoding':    'gzip, deflate, br, zstd',
-    'sec-ch-ua':          '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    'sec-ch-ua':          _BROWSER_IDENTITY['sec_ch_ua'],
     'sec-ch-ua-mobile':   '?0',
-    'sec-ch-ua-platform': '"Windows"',
+    'sec-ch-ua-platform': _BROWSER_IDENTITY['sec_ch_ua_platform'],
     'Origin':             'https://www.goofish.com',
     'Referer':            'https://www.goofish.com/',
     'sec-fetch-dest':     'empty',

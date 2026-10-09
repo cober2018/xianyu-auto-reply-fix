@@ -17,6 +17,8 @@ import random
 from loguru import logger
 from DrissionPage import Chromium, ChromiumOptions
 
+from utils.xianyu_utils import get_consistent_browser_identity
+
 def log_captcha_event(cookie_id: str, event_type: str, success: bool = None, details: str = ""):
     """简单记录滑块验证事件到txt文件"""
     try:
@@ -1739,6 +1741,7 @@ class DrissionHandler:
 class XianyuApis:
     def __init__(self):
         self.url = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/'
+        identity = get_consistent_browser_identity()
         self.session = requests.Session()
         self.session.headers.update({
             'accept': 'application/json',
@@ -1748,13 +1751,13 @@ class XianyuApis:
             'pragma': 'no-cache',
             'priority': 'u=1, i',
             'referer': 'https://www.goofish.com/',
-            'sec-ch-ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            'sec-ch-ua': identity['sec_ch_ua'],
             'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
+            'sec-ch-ua-platform': identity['sec_ch_ua_platform'],
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-site',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+            'user-agent': identity['user_agent'],
         })
         
     def clear_duplicate_cookies(self):

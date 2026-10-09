@@ -16,7 +16,7 @@ import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
     generate_device_id, generate_sign, get_stable_device_id,
-    build_runtime_chrome_ua
+    get_consistent_browser_identity
 )
 from config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
@@ -7279,29 +7279,10 @@ class XianyuLive:
             return False
 
     @staticmethod
-    def _get_local_token_browser_identity() -> Tuple[str, str]:
-        """让 Token 请求头与随后处理验证的本机浏览器版本保持一致。"""
-        full_version = '139.0.0.0'
-        browser_family = 'chrome'
-        try:
-            from utils.xianyu_slider_stealth import XianyuSliderStealth
-            detector = XianyuSliderStealth.__new__(XianyuSliderStealth)
-            info = detector._detect_local_browser_info() or {}
-            detected_version = str(info.get('version') or '').strip()
-            if re.fullmatch(r'\d+\.\d+\.\d+\.\d+', detected_version):
-                full_version = detected_version
-                browser_family = str(info.get('family') or 'chrome').lower()
-        except Exception as identity_error:
-            logger.debug(f"读取本机浏览器版本失败，使用兼容 UA: {identity_error}")
-
-        major_version = full_version.split('.', 1)[0]
-        user_agent = build_runtime_chrome_ua(full_version, browser_family)
-        brand_name = 'Microsoft Edge' if browser_family == 'edge' else 'Google Chrome'
-        sec_ch_ua = (
-            f'"{brand_name}";v="{major_version}", "Chromium";v="{major_version}", '
-            '"Not_A Brand";v="24"'
-        )
-        return user_agent, sec_ch_ua
+    def _get_local_token_browser_identity() -> Tuple[str, str, str]:
+        """让 Token 请求头与随后处理验证的本机浏览器版本保持一致(平台/版本/UA 三件套)。"""
+        identity = get_consistent_browser_identity()
+        return identity['user_agent'], identity['sec_ch_ua'], identity['sec_ch_ua_platform']
 
     async def _refresh_token_impl(self, captcha_retry_count: int = 0, post_slider_session_grace_used: bool = False,
                                   allow_password_login_recovery: bool = True,
@@ -7390,7 +7371,7 @@ class XianyuLive:
             params['sign'] = sign
 
             # 发送请求 - 使用与浏览器完全一致的请求头
-            token_user_agent, token_sec_ch_ua = self._get_local_token_browser_identity()
+            token_user_agent, token_sec_ch_ua, token_sec_ch_ua_platform = self._get_local_token_browser_identity()
             headers = {
                 'accept': 'application/json',
                 'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -7400,7 +7381,7 @@ class XianyuLive:
                 'priority': 'u=1, i',
                 'sec-ch-ua': token_sec_ch_ua,
                 'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-platform': token_sec_ch_ua_platform,
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'same-site',
@@ -9008,7 +8989,7 @@ class XianyuLive:
                 headers={
                     'cookie': self.cookies_str,
                     'Referer': 'https://www.goofish.com/',
-                    'User-Agent': build_runtime_chrome_ua('120.0.0.0'),
+                    'User-Agent': get_consistent_browser_identity()['user_agent'],
                 },
                 allow_redirects=True
             ) as response:
@@ -14160,7 +14141,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': build_runtime_chrome_ua('138.0.0.0')
+                'user_agent': get_consistent_browser_identity()['user_agent']
             }
 
             # 使用标准窗口大小
@@ -14551,7 +14532,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': build_runtime_chrome_ua('138.0.0.0')
+                'user_agent': get_consistent_browser_identity()['user_agent']
             }
 
             # 使用标准窗口大小
@@ -14840,7 +14821,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': build_runtime_chrome_ua('138.0.0.0')
+                'user_agent': get_consistent_browser_identity()['user_agent']
             }
 
             # 使用标准窗口大小

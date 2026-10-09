@@ -9,7 +9,7 @@ import aiohttp
 from PIL import Image
 from loguru import logger
 
-from utils.xianyu_utils import generate_sign, trans_cookies
+from utils.xianyu_utils import generate_sign, trans_cookies, get_consistent_browser_identity
 from utils.product_sku import build_sku_payload_fields, normalize_sku_config
 
 
@@ -19,10 +19,11 @@ class ItemPublisher:
     APP_KEY = "34839810"
     BASE_REFERER = "https://www.goofish.com/"
     BASE_ORIGIN = "https://www.goofish.com"
-    USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-    )
+    # 发布请求的浏览器身份:平台/版本跟随本机真实浏览器,与登录态浏览器指纹一致
+    _BROWSER_IDENTITY = get_consistent_browser_identity()
+    USER_AGENT = _BROWSER_IDENTITY['user_agent']
+    SEC_CH_UA = _BROWSER_IDENTITY['sec_ch_ua']
+    SEC_CH_UA_PLATFORM = _BROWSER_IDENTITY['sec_ch_ua_platform']
     ALLOWED_DELIVERY_CHOICES = {"包邮", "按距离计费", "一口价", "无需邮寄"}
     CATEGORY_PATH_ERROR_CODE = "FAIL_BIZ_CHANNEL_CAT_ID_PATH_QUERY_ERROR"
 
@@ -843,9 +844,9 @@ class ItemPublisher:
             "pragma": "no-cache",
             "priority": "u=1, i",
             "referer": self.BASE_REFERER,
-            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "sec-ch-ua": self.SEC_CH_UA,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-platform": self.SEC_CH_UA_PLATFORM,
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-site",

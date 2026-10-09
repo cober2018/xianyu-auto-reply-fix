@@ -32,17 +32,19 @@ import requests
 from loguru import logger
 
 from utils.build_cookies import UA, _MTOP_HEADERS, build_initial_session
+from utils.xianyu_utils import get_consistent_browser_identity
 from utils.xianyu_utils import generate_device_id
 
 
+_BROWSER_IDENTITY = get_consistent_browser_identity()
 _PASSPORT_HEADERS = {
     "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6",
     "Accept-Encoding": "gzip, deflate, br, zstd",
-    "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    "sec-ch-ua": _BROWSER_IDENTITY['sec_ch_ua'],
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua-platform": _BROWSER_IDENTITY['sec_ch_ua_platform'],
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",

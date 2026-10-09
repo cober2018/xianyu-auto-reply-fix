@@ -13,6 +13,8 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 from loguru import logger
 
+from utils.xianyu_utils import get_consistent_browser_identity
+
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
     try:
@@ -726,7 +728,7 @@ class XianyuSearcher:
                 user_data_dir,  # 第一个参数是用户数据目录，用于持久化
                 headless=True,  # 无头模式，后台运行
                 args=browser_args,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                user_agent=get_consistent_browser_identity()['user_agent'],
                 viewport={'width': 1280, 'height': 720},
                 locale='zh-CN',  # 设置语言为中文
                 # 持久化上下文会自动保存和加载：

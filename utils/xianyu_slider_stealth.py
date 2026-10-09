@@ -1959,7 +1959,7 @@ class XianyuSliderStealth:
 
     def _get_light_stealth_script(self, browser_features: Dict[str, Any]) -> str:
         locale = json.dumps(browser_features.get("locale") or "zh-CN", ensure_ascii=False)
-        platform = json.dumps(browser_features.get("platform") or "Win32", ensure_ascii=False)
+        platform = json.dumps(browser_features.get("platform") or get_runtime_platform_fingerprint()['navigator_platform'], ensure_ascii=False)
         vendor = json.dumps(browser_features.get("vendor") or "Google Inc.", ensure_ascii=False)
         user_agent = json.dumps(browser_features.get("user_agent") or "", ensure_ascii=False)
 
@@ -6652,6 +6652,8 @@ class XianyuSliderStealth:
 
         sec_ch_ua = ", ".join(sec_ch_ua_parts)
 
+        platform_fp = get_runtime_platform_fingerprint()
+
         return {
             "userAgent": user_agent,
             "fullVersion": full_version,
@@ -6660,11 +6662,11 @@ class XianyuSliderStealth:
             "fullVersionList": full_version_list,
             "secChUa": sec_ch_ua,
             "secChUaMobile": "?1" if browser_features.get("is_mobile") else "?0",
-            "secChUaPlatform": f'"{browser_features.get("platform") or "Windows"}"',
-            "platform": browser_features.get("platform") or "Windows",
-            "platformVersion": "10.0.0",
-            "architecture": "x86",
-            "bitness": "64",
+            "secChUaPlatform": platform_fp['sec_ch_ua_platform'],
+            "platform": browser_features.get("platform") or platform_fp['navigator_platform'],
+            "platformVersion": platform_fp['ua_ch_platform_version'],
+            "architecture": platform_fp['ua_ch_architecture'],
+            "bitness": platform_fp['ua_ch_bitness'],
             "mobile": bool(browser_features.get("is_mobile")),
             "model": "",
             "wow64": False,

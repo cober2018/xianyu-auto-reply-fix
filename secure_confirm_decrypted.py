@@ -8,7 +8,7 @@ import json
 import time
 import aiohttp
 from loguru import logger
-from utils.xianyu_utils import generate_sign, trans_cookies
+from utils.xianyu_utils import generate_sign, trans_cookies, get_consistent_browser_identity
 
 
 class SecureConfirm:
@@ -186,8 +186,7 @@ class SecureConfirm:
             # 避免跨事件循环复用session导致的timeout上下文错误；每次请求使用当前协程内的新session
             request_headers = {
                 'cookie': self.cookies_str,
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                              '(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'user-agent': get_consistent_browser_identity()['user_agent'],
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded'
             }

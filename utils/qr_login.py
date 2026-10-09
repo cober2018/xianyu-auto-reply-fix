@@ -10,6 +10,8 @@ import uuid
 import json
 import re
 from random import random
+
+from utils.xianyu_utils import get_consistent_browser_identity
 from typing import Optional, Dict, Any
 import httpx
 import qrcode
@@ -22,9 +24,9 @@ from utils.image_utils import image_manager
 
 
 def generate_headers():
-    """生成请求头"""
+    """生成请求头(浏览器身份跟随本机真实平台/版本)"""
     return {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': get_consistent_browser_identity()['user_agent'],
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -285,7 +287,7 @@ class QRLoginManager:
             context = await browser.new_context(
                 viewport={'width': 540, 'height': 960},
                 locale='zh-CN',
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                user_agent=get_consistent_browser_identity()['user_agent'],
                 ignore_https_errors=True,
                 extra_http_headers={
                     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'

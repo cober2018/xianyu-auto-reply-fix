@@ -15,6 +15,7 @@ import json
 from threading import Lock
 from collections import defaultdict
 from utils.time_utils import parse_local_datetime_text_to_db_utc
+from utils.xianyu_utils import get_consistent_browser_identity
 
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
@@ -95,16 +96,17 @@ class OrderDetailFetcher:
         self._pending_response_tasks = set()
         self._response_handler = None
 
-        # 请求头配置
+        # 请求头配置(浏览器身份跟随本机真实平台/版本)
+        _identity = get_consistent_browser_identity()
         self.headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "accept-language": "en,zh-CN;q=0.9,zh;q=0.8,ru;q=0.7",
             "cache-control": "no-cache",
             "pragma": "no-cache",
             "priority": "u=0, i",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
+            "sec-ch-ua": _identity['sec_ch_ua'],
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Windows\"",
+            "sec-ch-ua-platform": _identity['sec_ch_ua_platform'],
             "sec-fetch-dest": "document",
             "sec-fetch-mode": "navigate",
             "sec-fetch-site": "same-origin",
@@ -196,7 +198,7 @@ class OrderDetailFetcher:
             # 创建浏览器上下文
             self.context = await self.browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                user_agent=get_consistent_browser_identity()['user_agent']
             )
 
             logger.info("浏览器上下文创建成功，设置HTTP头...")
