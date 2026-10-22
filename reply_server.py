@@ -5352,563 +5352,10 @@ def _empty_slider_session_stats() -> Dict[str, Any]:
     }
 
 async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, show_browser: bool, user_id: int, current_user: Dict[str, Any]):
-    """后台执行账号密码登录任务"""
-    manual_refresh_acquired = False
-    manual_refresh_owner = f"password_login:{session_id}"
-    auth_recovery_owner = f"manual_password_login:{session_id}"
-    auth_recovery_acquired = False
-    login_thread_started = False
-    manual_refresh_preflight_timeout = 45.0
-    request_loop = asyncio.get_running_loop()
-    try:
-        log_with_user('info', f"开始执行账号密码登录任务: {session_id}, 账号: {account_id}", current_user)
-
-        from XianyuAutoAsync import XianyuLive
-
-        is_refresh_mode = password_login_sessions.get(session_id, {}).get('refresh_mode', False)
-        auth_session_state = XianyuLive.begin_auth_recovery_session(
-            account_id,
-            auth_recovery_owner,
-            mode='manual_cookie_refresh' if is_refresh_mode else 'manual_password_login',
-            source=manual_refresh_owner,
-            force_replace=False,
-        )
-        auth_recovery_acquired = auth_session_state.get('started', False)
-        if auth_session_state.get('already_active'):
-            active_owner = auth_session_state.get('active_owner', 'unknown')
-            _set_password_login_session_status(
-                session_id,
-                'failed',
-                error=f'该账号已有认证恢复流程进行中，请先完成当前验证或稍后再试（owner={active_owner}）'
-            )
-            _update_session_risk_log(session_id, 'failed', error_message=f'认证恢复流程进行中: {active_owner}')
-            log_with_user('warning', f"账号已有认证恢复流程在执行，拒绝重复触发: {account_id}, owner={active_owner}", current_user)
-            return
-
-        if is_refresh_mode:
-            manual_refresh_state = XianyuLive.begin_manual_refresh(account_id, source=manual_refresh_owner)
-            manual_refresh_acquired = manual_refresh_state.get('started', False)
-            if manual_refresh_state.get('already_active'):
-                _set_password_login_session_status(
-                    session_id,
-                    'failed',
-                    error='该账号正在执行手动刷新，请稍候再试'
-                )
-                _update_session_risk_log(session_id, 'failed', error_message='账号正在执行手动刷新')
-                log_with_user('warning', f"账号已存在手动刷新任务，拒绝重复触发: {account_id}", current_user)
-                return
-        
-        # 导入 XianyuSliderStealth
-        from utils.xianyu_slider_stealth import XianyuSliderStealth
-        import base64
-        import io
-        
-        # 创建 XianyuSliderStealth 实例
-        existing_cookie_info = db_manager.get_cookie_details(account_id) or {}
-        proxy_config = db_manager.get_cookie_proxy_config(account_id)
-        slider_instance = XianyuSliderStealth(
-            user_id=account_id,
-            enable_learning=True,
-            headless=resolve_headless_flag(show_browser),
-            initial_cookies=existing_cookie_info.get('value', ''),
-            proxy=proxy_config,
-        )
-        slider_instance.risk_session_id = password_login_sessions.get(session_id, {}).get('risk_session_id') or session_id
-        slider_instance.risk_trigger_scene = 'manual_password_refresh' if is_refresh_mode else 'password_login'
-        
-        # 更新会话信息
-        password_login_sessions[session_id]['slider_instance'] = slider_instance
-        
-        # 定义通知回调函数，用于检测到验证时返回验证链接或截图（同步函数）
-        def notification_callback(
-            message: str,
-            screenshot_path: str = None,
-            verification_url: str = None,
-            screenshot_path_new: str = None,
-            verification_type: str = None,
-        ):
-            """账号验证通知回调（同步）
-            
-            Args:
-                message: 通知消息
-                screenshot_path: 旧版截图路径（兼容参数）
-                verification_url: 验证链接
-                screenshot_path_new: 新版截图路径（新参数，优先使用）
-                verification_type: 验证类型
-            """
-            try:
-                # 优先使用新的截图路径参数
-                actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
-                verification_type_label = resolve_verification_type_label(
-                    verification_type,
-                    message,
-                    verification_url,
-                )
-
-                if _is_password_login_verification_timeout_message(message):
-                    _finalize_password_login_session_failure(session_id, message)
-                    log_with_user('warning', f"密码登录会话检测到失效验证页，直接标记失败: {session_id}", current_user)
-                    return
-                
-                # 优先使用截图路径，如果没有截图则使用验证链接
-                if actual_screenshot_path and os.path.exists(actual_screenshot_path):
-                    # 更新会话状态，保存截图路径
-                    _set_password_login_session_status(
-                        session_id,
-                        'verification_required',
-                        screenshot_path=actual_screenshot_path,
-                        verification_url=None,
-                        qr_code_url=None,
-                        verification_type=verification_type_label,
-                    )
-                    log_with_user('info', f"账号验证截图已保存: {session_id}, 路径: {actual_screenshot_path}", current_user)
-                    
-                    # 发送通知到用户配置的渠道
-                    def send_face_verification_notification():
-                        """在后台线程中发送账号验证通知"""
-                        try:
-                            log_with_user('info', f"开始尝试发送账号验证通知: {account_id}", current_user)
-                            notification_message = build_face_verify_notification(
-                                account_id=account_id,
-                                time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
-                                verification_type=verification_type_label,
-                                verification_url=verification_url or '',
-                                error_message=message,
-                                has_screenshot=True,
-                            )
-                            notification_sent = dispatch_account_notifications_sync(
-                                account_id,
-                                notification_message,
-                                title='闲鱼账号需要验证',
-                                notification_type='face_verify',
-                                attachment_path=actual_screenshot_path,
-                            )
-                            if notification_sent:
-                                log_with_user('info', f"✅ 已发送账号验证通知: {account_id}", current_user)
-                            else:
-                                log_with_user('warning', f"账号验证通知未发送成功: {account_id}", current_user)
-                        except Exception as notify_err:
-                            log_with_user('error', f"发送账号验证通知时出错: {str(notify_err)}", current_user)
-                            import traceback
-                            log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                    
-                    # 在后台线程中发送通知，避免阻塞登录流程
-                    import threading
-                    notification_thread = threading.Thread(target=send_face_verification_notification)
-                    notification_thread.daemon = True
-                    notification_thread.start()
-                    log_with_user('info', f"已启动账号验证通知发送线程: {account_id}", current_user)
-                elif verification_url:
-                    # 如果没有截图，使用验证链接（兼容旧版本）
-                    _set_password_login_session_status(
-                        session_id,
-                        'verification_required',
-                        verification_url=verification_url,
-                        screenshot_path=None,
-                        qr_code_url=None,
-                        verification_type=verification_type_label,
-                    )
-                    log_with_user('info', f"账号验证链接已保存: {session_id}, URL: {verification_url}", current_user)
-                    
-                    # 发送通知到用户配置的渠道
-                    def send_face_verification_notification():
-                        """在后台线程中发送账号验证通知"""
-                        try:
-                            log_with_user('info', f"开始尝试发送账号验证通知: {account_id}", current_user)
-                            notification_message = build_face_verify_notification(
-                                account_id=account_id,
-                                time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
-                                verification_type=verification_type_label,
-                                verification_url=verification_url or '无',
-                                error_message=message,
-                                has_screenshot=False,
-                            )
-                            notification_sent = dispatch_account_notifications_sync(
-                                account_id,
-                                notification_message,
-                                title='闲鱼账号需要验证',
-                                notification_type='face_verify',
-                            )
-                            if notification_sent:
-                                log_with_user('info', f"✅ 已发送账号验证通知: {account_id}", current_user)
-                            else:
-                                log_with_user('warning', f"账号验证通知未发送成功: {account_id}", current_user)
-                        except Exception as notify_err:
-                            log_with_user('error', f"发送账号验证通知时出错: {str(notify_err)}", current_user)
-                            import traceback
-                            log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                    
-                    # 在后台线程中发送通知，避免阻塞登录流程
-                    import threading
-                    notification_thread = threading.Thread(target=send_face_verification_notification)
-                    notification_thread.daemon = True
-                    notification_thread.start()
-                    log_with_user('info', f"已启动账号验证通知发送线程: {account_id}", current_user)
-            except Exception as e:
-                log_with_user('error', f"处理账号验证通知失败: {str(e)}", current_user)
-        
-        # 调用登录方法（同步方法，需要在后台线程中执行）
-        import threading
-
-        def run_login():
-            import asyncio  # 在函数开头导入，避免后续局部import导致UnboundLocalError
-            from db_manager import db_manager  # 在函数开头导入，避免作用域问题
-            from XianyuAutoAsync import XianyuLive
-            try:
-                cookies_dict = slider_instance.login_with_password_playwright(
-                    account=account,
-                    password=password,
-                    show_browser=show_browser,
-                    notification_callback=notification_callback,
-                    force_clean_context=is_refresh_mode
-                )
-                
-                if cookies_dict is None:
-                    failure_message = slider_instance.last_login_error or '登录失败，请检查账号密码是否正确'
-                    _finalize_password_login_session_failure(session_id, failure_message)
-                    log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {failure_message}", current_user)
-                    return
-                
-                log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
-                
-                # 检查是否已存在相同账号ID的Cookie
-                existing_cookies = db_manager.get_all_cookies(user_id)
-                is_new_account = account_id not in existing_cookies
-                existing_cookie_value = existing_cookies.get(account_id, '') if not is_new_account else ''
-                existing_cookie_dict = trans_cookies(existing_cookie_value) if existing_cookie_value else {}
-
-                merge_result = XianyuLive.protected_merge_cookie_dicts(existing_cookie_dict, cookies_dict)
-                if merge_result['incoming_missing_protected_fields']:
-                    log_with_user(
-                        'warning',
-                        f"密码登录返回的Cookie快照缺少关键字段，将进行保护性合并: {', '.join(merge_result['incoming_missing_protected_fields'])}",
-                        current_user
-                    )
-                if merge_result['preserved_protected_fields']:
-                    log_with_user(
-                        'warning',
-                        f"密码登录保护性保留旧关键字段: {', '.join(merge_result['preserved_protected_fields'])}",
-                        current_user
-                    )
-                if merge_result['account_switched']:
-                    log_with_user('warning', f"检测到unb变化，按账号切换处理: {account_id}", current_user)
-
-                merged_cookies_dict = merge_result['merged_cookies_dict']
-                log_with_user(
-                    'info',
-                    f"manual_login_protected_merge incoming_count={merge_result.get('incoming_count', len(cookies_dict))} "
-                    f"existing_count={merge_result.get('existing_count', len(existing_cookie_dict))} "
-                    f"merged_count={merge_result.get('merged_count', len(merged_cookies_dict))} "
-                    f"protected_preserved_fields={merge_result.get('preserved_protected_fields') or []} "
-                    f"would_remove_fields={merge_result.get('would_remove_fields') or []} "
-                    f"account_switched={merge_result.get('account_switched', False)}",
-                    current_user
-                )
-                cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
-
-                if merge_result['missing_required_fields']:
-                    missing_fields_text = ', '.join(merge_result['missing_required_fields'])
-                    error_message = f"登录成功但Cookie核心字段仍缺失，未覆盖旧Cookie: {missing_fields_text}"
-                    log_with_user('error', f"{error_message}: {account_id}", current_user)
-                    _finalize_password_login_session_failure(
-                        session_id,
-                        error_message,
-                        result_code='password_login_cookie_incomplete',
-                        event_meta={
-                            'missing_required_fields': merge_result['missing_required_fields'],
-                            'incoming_missing_protected_fields': merge_result['incoming_missing_protected_fields'],
-                            'preserved_protected_fields': merge_result['preserved_protected_fields'],
-                        },
-                    )
-                    return
-
-                if not is_refresh_mode:
-                    try:
-                        soft_preflight_timeout = max(
-                            8.0,
-                            min(float(RISK_CONTROL.get('soft_auth_token_preflight_timeout_seconds', 5.0) or 5.0) + 3.0, 18.0)
-                        )
-                        log_with_user('info', f"密码登录成功后开始轻量Token软预检（失败不阻断原流程）: {account_id}", current_user)
-                        temp_preflight_xianyu = XianyuLive(
-                            cookies_str=cookies_str,
-                            cookie_id=account_id,
-                            user_id=user_id,
-                            register_instance=False,
-                        )
-                        soft_preflight_future = asyncio.run_coroutine_threadsafe(
-                            temp_preflight_xianyu.soft_preflight_token_after_auth(
-                                cookies_str,
-                                source='password_login',
-                                proxy=proxy_config,
-                            ),
-                            request_loop,
-                        )
-                        try:
-                            soft_preflight_result = soft_preflight_future.result(timeout=soft_preflight_timeout)
-                            log_with_user(
-                                'info',
-                                f"密码登录轻量Token软预检完成: {account_id}, status={soft_preflight_result.get('status')}, token_cached={soft_preflight_result.get('token_cached')}",
-                                current_user,
-                            )
-                        except concurrent.futures.TimeoutError:
-                            soft_preflight_future.cancel()
-                            log_with_user('warning', f"密码登录轻量Token软预检超时，不阻断保存与启动任务: {account_id}", current_user)
-                    except Exception as soft_preflight_err:
-                        log_with_user(
-                            'warning',
-                            f"密码登录轻量Token软预检失败，不阻断保存与启动任务: {account_id}, 错误: {str(soft_preflight_err)}",
-                            current_user,
-                        )
-
-                if is_refresh_mode:
-                    try:
-                        log_with_user('info', f"刷新模式开始执行Token预检，确认新实例可直接恢复: {account_id}", current_user)
-                        XianyuLive.mark_manual_refresh_handoff(account_id, source=manual_refresh_owner)
-                        temp_xianyu = XianyuLive(
-                            cookies_str=cookies_str,
-                            cookie_id=account_id,
-                            user_id=user_id,
-                            register_instance=False,
-                        )
-                        preflight_future = asyncio.run_coroutine_threadsafe(
-                            temp_xianyu.preflight_token_after_manual_refresh(),
-                            request_loop,
-                        )
-                        try:
-                            preflight_future.result(timeout=manual_refresh_preflight_timeout)
-                        except concurrent.futures.TimeoutError as timeout_err:
-                            preflight_future.cancel()
-                            raise TimeoutError(
-                                f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成"
-                            ) from timeout_err
-                        cookies_str = temp_xianyu.cookies_str
-                        merged_cookies_dict = trans_cookies(cookies_str)
-                        log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
-                    except Exception as preflight_err:
-                        error_message = f"刷新模式认证预检失败，任务未切换: {str(preflight_err)}"
-                        log_with_user('error', f"{error_message}: {account_id}", current_user)
-                        _finalize_password_login_session_failure(
-                            session_id,
-                            error_message,
-                            result_code='manual_refresh_preflight_failed',
-                            event_meta={'account_id': account_id},
-                        )
-                        return
-                
-                # 保存账号密码和Cookie到数据库
-                # 使用 update_cookie_account_info 来保存，它会自动处理新账号和现有账号的情况
-                # 注意：刷新模式下不更新 show_browser，避免临时调试选项被永久保存
-                update_success = db_manager.update_cookie_account_info(
-                    account_id,
-                    cookie_value=cookies_str,
-                    username=account,
-                    password=password,
-                    show_browser=show_browser if not is_refresh_mode else None,  # 刷新模式不更新此字段
-                    user_id=user_id  # 新账号时需要提供user_id
-                )
-                
-                if update_success:
-                    if is_new_account:
-                        log_with_user('info', f"新账号Cookie和账号密码已保存: {account_id}", current_user)
-                    else:
-                        log_with_user('info', f"现有账号Cookie和账号密码已更新: {account_id}", current_user)
-                else:
-                    log_with_user('error', f"保存账号信息失败: {account_id}", current_user)
-                
-                # 统一走 CookieManager，确保任务登记、实例切换和运行态一致
-                if cookie_manager.manager:
-                    try:
-                        if is_new_account:
-                            cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
-                            log_with_user('info', f"已将新账号加入cookie_manager并启动任务: {account_id}", current_user)
-                        else:
-                            cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
-                            log_with_user('info', f"已更新cookie_manager并重启任务: {account_id}", current_user)
-                    except Exception as manager_err:
-                        action_desc = '启动新账号任务' if is_new_account else '切换账号任务'
-                        log_with_user('warning', f"{action_desc}失败: {account_id}, 错误: {str(manager_err)}", current_user)
-                
-                if is_refresh_mode:
-                    log_with_user('info', f"刷新模式已完成Token预检，直接切换到通过预检的新Cookie: {account_id}", current_user)
-                else:
-                    # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
-                    try:
-                        log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
-                        
-                        # 创建临时的XianyuLive实例来刷新Cookie
-                        temp_xianyu = XianyuLive(
-                            cookies_str=cookies_str,
-                            cookie_id=account_id,
-                            user_id=user_id,
-                            register_instance=False,
-                        )
-                        
-                        # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
-                        try:
-                            temp_xianyu.reset_qr_cookie_refresh_flag()
-                            log_with_user('info', f"已重置扫码登录Cookie刷新标志: {account_id}", current_user)
-                        except Exception as reset_err:
-                            log_with_user('debug', f"重置扫码登录Cookie刷新标志失败（不影响刷新）: {str(reset_err)}", current_user)
-                        
-                        # 在后台异步执行刷新（不阻塞主流程）
-                        async def refresh_cookies_task():
-                            try:
-                                refresh_success = await temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False)
-                                if refresh_success:
-                                    log_with_user('info', f"Cookie刷新成功: {account_id}", current_user)
-                                    # 刷新成功后，从数据库获取更新后的Cookie
-                                    updated_cookie_info = db_manager.get_cookie_details(account_id)
-                                    if updated_cookie_info:
-                                        refreshed_cookies = updated_cookie_info.get('value', '')
-                                        if refreshed_cookies:
-                                            # 更新cookie_manager中的Cookie
-                                            if cookie_manager.manager:
-                                                cookie_manager.manager.update_cookie(account_id, refreshed_cookies, save_to_db=False)
-                                            log_with_user('info', f"已更新刷新后的Cookie到cookie_manager: {account_id}", current_user)
-                                else:
-                                    log_with_user('warning', f"Cookie刷新失败或跳过: {account_id}", current_user)
-                            except Exception as refresh_e:
-                                log_with_user('error', f"刷新Cookie时出错: {account_id}, 错误: {str(refresh_e)}", current_user)
-                                import traceback
-                                logger.error(traceback.format_exc())
-                        
-                        # 在后台线程中运行异步任务
-                        # 由于run_login是在线程中运行的，需要创建新的事件循环
-                        def run_async_refresh():
-                            try:
-                                import asyncio
-                                # 创建新的事件循环
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(refresh_cookies_task())
-                                finally:
-                                    new_loop.close()
-                            except Exception as e:
-                                log_with_user('error', f"运行异步刷新任务失败: {account_id}, 错误: {str(e)}", current_user)
-                        
-                        # 在后台线程中执行刷新任务
-                        refresh_thread = threading.Thread(target=run_async_refresh, daemon=True)
-                        refresh_thread.start()
-                        
-                    except Exception as refresh_err:
-                        log_with_user('warning', f"调用_refresh_cookies_via_browser失败: {account_id}, 错误: {str(refresh_err)}", current_user)
-                        # 刷新失败不影响登录成功
-                
-                # 更新会话状态
-                _set_password_login_session_status(
-                    session_id,
-                    'success',
-                    account_id=account_id,
-                    is_new_account=is_new_account,
-                    cookie_count=len(merged_cookies_dict)
-                )
-                _close_password_login_pending_verification_risk_logs(
-                    session_id,
-                    'success',
-                    processing_result='人工验证已完成，登录流程已成功收尾',
-                )
-                # 更新风控日志状态
-                _update_session_risk_log(
-                    session_id,
-                    'success',
-                    processing_result='Cookie刷新成功，认证预检通过' if is_refresh_mode else 'Cookie刷新成功'
-                )
-
-                # 发送登录成功通知（使用模板系统）
-                try:
-                    # 根据模式选择不同模板
-                    notify_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
-                    template_type = 'cookie_refresh_success' if notify_refresh_mode else 'password_login_success'
-
-                    notification_message = render_notification_template(
-                        template_type,
-                        account_id=account_id,
-                        time=time.strftime('%Y-%m-%d %H:%M:%S'),
-                        cookie_count=str(len(merged_cookies_dict))
-                    )
-
-                    login_type = "刷新Cookie" if notify_refresh_mode else "密码登录"
-                    notification_sent = dispatch_account_notifications_sync(
-                        account_id,
-                        notification_message,
-                        title=f"{login_type}成功",
-                        notification_type=template_type,
-                    )
-                    if notification_sent:
-                        log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
-                    else:
-                        log_with_user('warning', f"{login_type}成功通知未发送成功: {account_id}", current_user)
-                except Exception as notify_err:
-                    log_with_user('warning', f"发送登录成功通知失败: {account_id}, 错误: {str(notify_err)}", current_user)
-
-                if is_refresh_mode and session_id in password_login_sessions:
-                    screenshot_path = password_login_sessions[session_id].get('screenshot_path')
-                    verification_url = password_login_sessions[session_id].get('verification_url')
-                    verification_type = password_login_sessions[session_id].get('verification_type')
-                    if screenshot_path or verification_url:
-                        _set_password_login_session_status(
-                            session_id,
-                            'success',
-                            screenshot_path=screenshot_path,
-                            verification_url=verification_url,
-                            verification_type=verification_type,
-                        )
-                
-            except Exception as e:
-                error_msg = str(e)
-                _finalize_password_login_session_failure(session_id, error_msg)
-                log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {error_msg}", current_user)
-                logger.info(f"会话 {session_id} 状态已更新为 failed，错误消息: {error_msg}")  # 添加日志确认状态更新
-                import traceback
-                logger.error(traceback.format_exc())
-            finally:
-                # 清理实例（释放并发槽位）
-                try:
-                    from utils.xianyu_slider_stealth import concurrency_manager
-                    if concurrency_manager.unregister_instance(account_id, slider_instance):
-                        log_with_user('debug', f"已释放并发槽位: {account_id}", current_user)
-                except Exception as cleanup_e:
-                    log_with_user('warning', f"清理实例时出错: {str(cleanup_e)}", current_user)
-
-                if manual_refresh_acquired:
-                    try:
-                        from XianyuAutoAsync import XianyuLive
-                        XianyuLive.end_manual_refresh(account_id, source=manual_refresh_owner)
-                        log_with_user('info', f"已结束手动刷新保护: {account_id}", current_user)
-                    except Exception as manual_cleanup_e:
-                        log_with_user('warning', f"结束手动刷新保护失败: {account_id}, 错误: {str(manual_cleanup_e)}", current_user)
-
-                if auth_recovery_acquired:
-                    try:
-                        from XianyuAutoAsync import XianyuLive
-                        XianyuLive.end_auth_recovery_session(account_id, auth_recovery_owner)
-                        log_with_user('info', f"已结束认证恢复单飞锁: {account_id}", current_user)
-                    except Exception as auth_cleanup_e:
-                        log_with_user('warning', f"结束认证恢复单飞锁失败: {account_id}, 错误: {str(auth_cleanup_e)}", current_user)
-        
-        # 在后台线程中执行登录
-        login_thread = threading.Thread(target=run_login, daemon=True)
-        login_thread.start()
-        login_thread_started = True
-        
-    except Exception as e:
-        _finalize_password_login_session_failure(session_id, str(e))
-        log_with_user('error', f"执行账号密码登录任务异常: {str(e)}", current_user)
-        if manual_refresh_acquired and not login_thread_started:
-            try:
-                from XianyuAutoAsync import XianyuLive
-                XianyuLive.end_manual_refresh(account_id, source=manual_refresh_owner)
-            except Exception:
-                pass
-        if auth_recovery_acquired and not login_thread_started:
-            try:
-                from XianyuAutoAsync import XianyuLive
-                XianyuLive.end_auth_recovery_session(account_id, auth_recovery_owner)
-            except Exception:
-                pass
-        import traceback
-        logger.error(traceback.format_exc())
+    """闲鱼账号密码重登已关闭。不读取密码，不创建浏览器，不启动登录线程。"""
+    del account, password, show_browser, user_id
+    log_with_user('warning', f"密码重登已关闭，拒绝执行登录任务: {session_id}, 账号: {account_id}，请使用扫码登录", current_user)
+    return
 
 
 async def _execute_manual_cookie_import(
@@ -6272,116 +5719,11 @@ async def password_login(
     request: Dict[str, Any],
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """账号密码登录接口（异步，支持人脸认证）"""
-    try:
-        account_id = request.get('account_id')
-        account = request.get('account')
-        password = request.get('password')
-        # 检查前端是否明确指定了 show_browser 参数
-        show_browser_specified = 'show_browser' in request
-        show_browser = request.get('show_browser', False)
-        refresh_mode = request.get('refresh_mode', False)  # 刷新模式：从数据库读取账密
-        risk_log_id = None
-
-        user_id = current_user['user_id']
-
-        # 刷新模式：从数据库读取已保存的账号密码
-        if refresh_mode and account_id:
-            from XianyuAutoAsync import XianyuLive
-            cookie_info = db_manager.get_cookie_details(account_id)
-            if not cookie_info:
-                return {'success': False, 'message': f'未找到账号: {account_id}'}
-
-            # 验证账号归属
-            if cookie_info.get('user_id') != user_id:
-                return {'success': False, 'message': '无权操作此账号'}
-
-            account = cookie_info.get('username')
-            password = cookie_info.get('password')
-
-            if not account or not password:
-                return {'success': False, 'message': '该账号未配置用户名和密码，无法刷新Cookie'}
-
-            # 获取 show_browser 设置（只有当前端没有明确指定时，才使用数据库配置）
-            if not show_browser_specified:
-                show_browser = cookie_info.get('show_browser', False)
-
-            log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, show_browser: {show_browser}", current_user)
-
-            if XianyuLive.is_manual_refresh_active(account_id):
-                return {'success': False, 'message': f'账号 {account_id} 正在执行手动刷新，请稍候再试'}
-
-        if not account_id or not account or not password:
-            return {'success': False, 'message': '账号ID、登录账号和密码不能为空'}
-
-        log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
-        
-        # 生成会话ID
-        session_id = secrets.token_urlsafe(16)
-        risk_session_id = _new_risk_log_session_id('pwd')
-
-        # 记录手动刷新Cookie到风控日志
-        risk_log_id = None
-        if refresh_mode:
-            try:
-                risk_log_id = db_manager.add_risk_control_log(
-                    cookie_id=account_id,
-                    event_type='cookie_refresh',
-                    session_id=risk_session_id,
-                    trigger_scene='manual_password_refresh',
-                    result_code='manual_cookie_refresh_started',
-                    event_description='手动触发账密Cookie刷新',
-                    processing_status='processing',
-                    event_meta=_build_risk_event_meta({
-                        'account_id': account_id,
-                        'show_browser': bool(show_browser),
-                        'refresh_mode': True,
-                    })
-                )
-            except Exception as log_e:
-                risk_log_id = None
-                logger.error(f"记录风控日志失败: {log_e}")
-        
-        user_id = current_user['user_id']
-        
-        # 创建登录会话
-        password_login_sessions[session_id] = {
-            'account_id': account_id,
-            'account': account,
-            'show_browser': show_browser,
-            'refresh_mode': refresh_mode,  # 保存刷新模式标志
-            'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
-            'risk_session_id': risk_session_id,
-            'status': 'processing',
-            'verification_url': None,
-            'screenshot_path': None,
-            'qr_code_url': None,
-            'verification_type': None,
-            'slider_instance': None,
-            'task': None,
-            'timestamp': time.time(),
-            'completed_at': None,
-            'user_id': user_id
-        }
-        
-        # 启动后台登录任务
-        task = asyncio.create_task(_execute_password_login(
-            session_id, account_id, account, password, show_browser, user_id, current_user
-        ))
-        password_login_sessions[session_id]['task'] = task
-        
-        return {
-            'success': True,
-            'session_id': session_id,
-            'status': 'processing',
-            'message': '登录任务已启动，请等待...'
-        }
-        
-    except Exception as e:
-        log_with_user('error', f"账号密码登录异常: {str(e)}", current_user)
-        import traceback
-        logger.error(traceback.format_exc())
-        return {'success': False, 'message': f'登录失败: {str(e)}'}
+    """闲鱼账号密码重登已关闭。不读取请求或数据库里的密码，也不启动浏览器。"""
+    return {
+        'success': False,
+        'message': '密码重登已关闭，请使用扫码登录',
+    }
 
 
 @app.get("/password-login/check/{session_id}")
@@ -10199,6 +9541,7 @@ class ProductSinglePublishRequest(BaseModel):
     brand: Optional[str] = None
     condition: Optional[str] = "全新"
     sku_config: Optional[Dict[str, Any]] = None
+    quantity: Optional[int] = 999
 
 
 def _parse_optional_non_negative_float(value: Any, field_label: str) -> Optional[float]:
@@ -10403,6 +9746,13 @@ def _normalize_product_publish_data(data: Dict[str, Any], *, partial: bool = Fal
         except ProductSkuValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if 'quantity' in data or not partial:
+        from utils.item_publisher import normalize_publish_quantity
+        try:
+            normalized['quantity'] = normalize_publish_quantity(data.get('quantity'))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     sku_enabled = bool((normalized.get('sku_config') or {}).get('enabled'))
     if original_price is not None and current_price is None and not sku_enabled:
         raise HTTPException(status_code=400, detail="填写原价时必须同时填写现价")
@@ -10466,6 +9816,7 @@ async def _publish_product_to_account(
     material_id: Optional[int] = None,
     batch_id: Optional[str] = None,
     log_id: Optional[int] = None,
+    quantity: int = 999,
 ) -> Dict[str, Any]:
     from utils.item_publisher import ItemPublisher
 
@@ -10534,6 +9885,7 @@ async def _publish_product_to_account(
                 can_self_pickup=bool(can_self_pickup),
                 category_hint=category_hint,
                 sku_config=normalized_sku_config,
+                quantity=quantity,
             )
             latest_cookies_str = publisher.cookies_str
             published_item_id = publisher.extract_published_item_id(publish_result)
@@ -10660,6 +10012,7 @@ async def _run_product_batch_publish(batch_id: str, jobs: List[Dict[str, Any]], 
                 material_id=material.get('id'),
                 batch_id=batch_id,
                 log_id=log_id,
+                quantity=material.get('quantity') or 999,
             )
         except HTTPException as exc:
             logger.warning(
@@ -10809,6 +10162,7 @@ async def publish_product_json(
         "brand": request.brand,
         "condition": request.condition,
         "sku_config": request.sku_config,
+        "quantity": request.quantity,
     }, partial=False)
     return await _publish_product_to_account(
         current_user=current_user,
@@ -10823,6 +10177,7 @@ async def publish_product_json(
         can_self_pickup=bool(data.get('can_self_pickup')),
         category_hint=data.get('category'),
         sku_config=data.get('sku_config'),
+        quantity=data.get('quantity') or 999,
     )
 
 
@@ -11053,6 +10408,7 @@ async def publish_item(
     post_price: str = Form(default=""),
     can_self_pickup: str = Form(default="false"),
     sku_config: str = Form(default=""),
+    quantity: str = Form(default="999"),
     images: List[UploadFile] = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -11071,6 +10427,12 @@ async def publish_item(
             "content": image_content,
         })
 
+    from utils.item_publisher import normalize_publish_quantity
+    try:
+        publish_quantity = normalize_publish_quantity(quantity)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     return await _publish_product_to_account(
         current_user=current_user,
         account_id=cookie_id,
@@ -11084,6 +10446,7 @@ async def publish_item(
         can_self_pickup=_parse_form_bool(can_self_pickup),
         category_hint=category,
         sku_config=sku_config,
+        quantity=publish_quantity,
     )
 
 
@@ -11127,6 +10490,126 @@ def get_item_detail(cookie_id: str, item_id: str, current_user: Dict[str, Any] =
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品详情失败: {str(e)}")
+
+
+class ItemQuantityUpdateRequest(BaseModel):
+    quantity: Optional[int] = 999
+    title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    images: Optional[List[Any]] = None
+    categoryId: Optional[str] = None
+    catId: Optional[str] = None
+    catName: Optional[str] = None
+    channelCatId: Optional[str] = None
+    tbCatId: Optional[str] = None
+
+
+def _merge_item_quantity_fields(cookie_id: str, item_id: str, request: ItemQuantityUpdateRequest) -> Dict[str, Any]:
+    item = db_manager.get_item_info(cookie_id, item_id) or {}
+    detail = item.get('item_detail_parsed') if isinstance(item.get('item_detail_parsed'), dict) else {}
+    if not detail and item.get('item_detail'):
+        try:
+            parsed = json.loads(item.get('item_detail') or '')
+            if isinstance(parsed, dict):
+                detail = parsed
+        except Exception:
+            detail = {}
+    text_dto = detail.get('itemTextDTO') if isinstance(detail.get('itemTextDTO'), dict) else {}
+    cat_dto = detail.get('itemCatDTO') if isinstance(detail.get('itemCatDTO'), dict) else {}
+
+    def _first(*values):
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, (list, dict)) and not value:
+                continue
+            return value
+        return None
+
+    title = _first(request.title, detail.get('title'), text_dto.get('title'), item.get('item_title'))
+    description = _first(
+        request.description,
+        detail.get('description'),
+        detail.get('desc'),
+        text_dto.get('desc'),
+        item.get('item_description'),
+    )
+    price = request.price
+    if price is None:
+        price = _first(detail.get('price'), detail.get('soldPrice'), item.get('item_price'))
+    images = request.images if request.images else None
+    if not images:
+        images = _first(detail.get('images'), detail.get('imageInfoDOList'), detail.get('imageUrls'))
+    category_id = _first(
+        request.categoryId,
+        request.channelCatId,
+        detail.get('categoryId'),
+        detail.get('channelCatId'),
+        cat_dto.get('channelCatId'),
+        cat_dto.get('catId'),
+    )
+    if not category_id:
+        raw_category = str(item.get('item_category') or '').strip()
+        if raw_category.isdigit():
+            category_id = raw_category
+
+    return {
+        "title": title,
+        "description": description,
+        "price": price,
+        "images": images or [],
+        "categoryId": category_id,
+        "catId": _first(request.catId, cat_dto.get('catId'), category_id),
+        "catName": _first(request.catName, cat_dto.get('catName')),
+        "channelCatId": _first(request.channelCatId, cat_dto.get('channelCatId'), category_id),
+        "tbCatId": _first(request.tbCatId, cat_dto.get('tbCatId')),
+    }
+
+
+@app.post("/items/{cookie_id}/{item_id}/quantity")
+async def update_item_quantity(
+    cookie_id: str,
+    item_id: str,
+    request: ItemQuantityUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """把在售商品库存改成指定数量，默认 999。必须带齐标题、价格、图片和类目，不新发商品。"""
+    from utils.item_publisher import ItemPublisher
+
+    user_id = current_user['user_id']
+    user_cookies = db_manager.get_all_cookies(user_id)
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+    cookies_str = str(user_cookies.get(cookie_id) or '').strip()
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="账号 Cookie 为空，无法修改库存")
+
+    item_fields = _merge_item_quantity_fields(cookie_id, item_id, request)
+    proxy_config = db_manager.get_cookie_proxy_config(cookie_id)
+    try:
+        async with ItemPublisher(cookies_str, cookie_id, proxy_config=proxy_config) as publisher:
+            result = await publisher.edit_item_quantity(
+                item_id=item_id,
+                item_fields=item_fields,
+                quantity=request.quantity if request.quantity is not None else 999,
+            )
+            latest_cookies_str = publisher.cookies_str
+            if not publisher.is_success_response(result):
+                raise HTTPException(status_code=400, detail=f"修改库存失败: {publisher.extract_error_message(result)}")
+        _persist_cookie_value_for_account(cookie_id, current_user, cookies_str, latest_cookies_str)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"修改在售库存异常: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=f"修改库存异常: {str(exc)}")
+
+    return {"success": True, "item_id": item_id, "quantity": request.quantity if request.quantity is not None else 999}
 
 
 class ItemDetailUpdate(BaseModel):

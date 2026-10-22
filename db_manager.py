@@ -7418,6 +7418,32 @@ Cookie数量: {cookie_count}
 
         return None
 
+    def has_pending_shipment(self, cookie_id: str) -> bool:
+        """账号是否还有已付款但未完成发货的订单。只探一行，不做买家昵称回填。"""
+        if not cookie_id:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT 1 FROM orders
+                    WHERE cookie_id = ?
+                      AND order_status IN (
+                          'pending_ship',
+                          'pending_delivery',
+                          'partial_success',
+                          'partial_pending_finalize'
+                      )
+                    LIMIT 1
+                    ''',
+                    (cookie_id,),
+                )
+                return cursor.fetchone() is not None
+            except Exception as e:
+                logger.error(f"查询待发货订单失败: cookie_id={cookie_id} - {e}")
+                return False
+
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
         """根据Cookie ID获取订单列表"""
         with self.lock:

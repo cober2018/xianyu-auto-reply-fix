@@ -15,9 +15,9 @@
   xianyu_api.py qr-refresh                   # POST /qr-login/refresh-cookies
   xianyu_api.py qr-cooldown <cookie_id>      # GET /qr-login/cooldown-status/{cookie_id}
   xianyu_api.py qr-reset-cooldown <cookie_id>
-  xianyu_api.py pwd-login <cookie_id>        # POST /password-login (refresh_mode, 用已存账密)
-  xianyu_api.py pwd-check <session_id>       # GET /password-login/check/{session_id}
-  xianyu_api.py pwd-cancel <session_id>
+  xianyu_api.py pwd-login <cookie_id>        # 已关闭，不会发起请求
+  xianyu_api.py pwd-check <session_id>       # 已关闭，不会发起请求
+  xianyu_api.py pwd-cancel <session_id>      # 已关闭，不会发起请求
 
 凭证保存在 ~/.config/xianyu-skill/credentials.json(权限 0600)。
 环境变量 XIANYU_BASE_URL / XIANYU_USERNAME / XIANYU_PASSWORD 优先于已存凭证。
@@ -195,6 +195,13 @@ def main():
         simple_body={"account_id": "@arg", "refresh_mode": True})
 
     args = parser.parse_args()
+
+    if getattr(args, "command", "") in {"pwd-login", "pwd-check", "pwd-cancel"}:
+        print(json.dumps({
+            "http_status": None,
+            "body": {"success": False, "message": "密码重登已关闭，请使用扫码登录"},
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
 
     if hasattr(args, "func"):  # login
         args.func(args)

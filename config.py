@@ -146,6 +146,7 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'auto_delivery_night_delay_range': [180, 900],
     # 拟人化：夜间窗口内自动回复延迟拉长(秒)，模拟卖家睡觉；白天固定 2~10 秒
     'night_reply_delay_range': [60, 480],
+    'auto_captcha_recovery_enabled': False,
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):

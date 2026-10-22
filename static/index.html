@@ -490,17 +490,11 @@
                     <br>
                     <small class="opacity-75">纯 HTTP，无浏览器，秒级出码</small>
                   </button>
-                  <button type="button" class="btn btn-outline-primary btn-lg flex-fill password-login-btn" onclick="togglePasswordLogin()" style="max-width: 300px;">
+                  <button type="button" class="btn btn-outline-secondary btn-lg flex-fill" disabled style="max-width: 300px;">
                     <i class="bi bi-key me-2"></i>
-                    <span class="fw-bold">账密登录</span>
+                    <span class="fw-bold">账密登录已关闭</span>
                     <br>
-                    <small class="opacity-75">需填写账号密码，成功后自动保存</small>
-                  </button>
-                  <button type="button" class="btn btn-outline-warning btn-lg flex-fill refresh-cookie-btn" onclick="toggleRefreshCookieForm()" style="max-width: 300px;">
-                    <i class="bi bi-arrow-repeat me-2"></i>
-                    <span class="fw-bold">手动刷新 Cookie</span>
-                    <br>
-                    <small class="opacity-75">使用已保存账密手动刷新已有账号</small>
+                    <small class="opacity-75">请使用扫码登录</small>
                   </button>
                   <button type="button" class="btn btn-outline-secondary btn-lg flex-fill manual-input-btn" onclick="toggleManualInput()" style="max-width: 300px;">
                     <i class="bi bi-keyboard me-2"></i>
@@ -513,7 +507,7 @@
             </div>
 
             <div class="text-center text-muted small mb-4">
-              建议优先使用扫码登录或账密登录添加账号，并尽快配置账密。未配置账密时，账号掉线后部分风控与恢复场景可能无法继续处理；如遇掉线，可优先尝试扫码登录或手动刷新 Cookie。
+              账号掉线后请使用扫码登录或轻量扫码重新登录。密码重登已关闭。
             </div>
 
             <!-- 账号密码登录表单（默认隐藏） -->
@@ -5765,13 +5759,13 @@
             <div class="mb-3">
               <label class="form-label">用户名</label>
               <input type="text" class="form-control" id="editAccountUsername" placeholder="输入用户名（可选）">
-              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复</div>
+              <div class="form-text">密码重登已关闭，此字段不再用于自动重登</div>
             </div>
             
             <div class="mb-3">
               <label class="form-label">密码</label>
               <input type="password" class="form-control" id="editAccountPassword" placeholder="输入密码（可选）">
-              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复</div>
+              <div class="form-text">密码重登已关闭，此字段不再用于自动重登</div>
             </div>
             
             <div class="mb-3">
@@ -5784,7 +5778,7 @@
               </div>
               <div class="form-text text-warning">
                 <i class="bi bi-exclamation-triangle me-1"></i>
-                该设置会影响账密登录、手动刷新 Cookie 和自动恢复流程。仅建议在本机排查滑块、人脸或风控页面时开启，服务器环境不要开启。
+                密码重登已关闭。此开关不再用于账密登录或自动重登。
               </div>
             </div>
 
@@ -5836,8 +5830,8 @@
               <strong>提示：</strong>
               <ul class="mb-0 mt-2">
                 <li>Cookie是必填项，其他字段可选</li>
-                <li>配置用户名和密码后，系统可在需要时通过账密流程刷新 Cookie</li>
-                <li>开启“显示浏览器”后，该账号的账密相关流程会优先使用有头模式</li>
+                <li>账号掉线后只能扫码登录，系统不会再用保存的密码重登</li>
+                <li>显示浏览器只影响扫码或手动导入时的排查，不会启动账密登录</li>
                 <li><strong>代理配置：</strong>为每个账号设置独立代理，可实现IP隔离，降低账号关联风险</li>
               </ul>
             </div>

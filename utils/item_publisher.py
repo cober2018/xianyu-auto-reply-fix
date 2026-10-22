@@ -13,6 +13,35 @@ from utils.xianyu_utils import generate_sign, trans_cookies, get_consistent_brow
 from utils.product_sku import build_sku_payload_fields, normalize_sku_config
 
 
+DEFAULT_PUBLISH_QUANTITY = 999
+PUBLISH_QUANTITY_MAX = 9999
+PUBLISH_SENSITIVE_REPLACEMENTS = (("直通", "系统进阶"),)
+
+
+def sanitize_publish_text(text: str) -> str:
+    result = str(text or "")
+    for source, target in PUBLISH_SENSITIVE_REPLACEMENTS:
+        result = result.replace(source, target)
+    return result
+
+
+def normalize_publish_quantity(value: Any = None, default: int = DEFAULT_PUBLISH_QUANTITY) -> int:
+    if value is None or (isinstance(value, str) and not str(value).strip()):
+        quantity = int(default)
+    else:
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError
+            quantity = int(value) if isinstance(value, int) else int(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValueError("库存必须是正整数") from None
+    if isinstance(quantity, bool) or quantity <= 0 or quantity > PUBLISH_QUANTITY_MAX:
+        raise ValueError(f"库存必须是 1 到 {PUBLISH_QUANTITY_MAX} 的整数")
+    return quantity
+
+
 class ItemPublisher:
     """闲鱼商品发布服务。"""
 
@@ -294,6 +323,7 @@ class ItemPublisher:
         can_self_pickup: bool,
         category_hint: Optional[str] = None,
         sku_config: Optional[Dict[str, Any]] = None,
+        quantity: int = DEFAULT_PUBLISH_QUANTITY,
     ) -> Dict[str, Any]:
         if delivery_choice not in self.ALLOWED_DELIVERY_CHOICES:
             raise ValueError("不支持的运费方式")
@@ -317,8 +347,13 @@ class ItemPublisher:
 
         uploaded_sku_config = await self.prepare_sku_config_for_publish(normalized_sku_config)
 
-        publish_title = str(title or "").strip()
-        publish_desc = str(description or title or "").strip()
+        raw_title = str(title or "").strip()
+        raw_desc = str(description or title or "").strip()
+        publish_title = sanitize_publish_text(raw_title)
+        publish_desc = sanitize_publish_text(raw_desc)
+        if publish_title != raw_title or publish_desc != raw_desc:
+            logger.info(f"【{self.cookie_id}】发布文案已替换敏感词")
+        publish_quantity = normalize_publish_quantity(quantity)
         if not publish_title:
             raise ValueError("商品标题不能为空")
         if not publish_desc:
@@ -346,6 +381,7 @@ class ItemPublisher:
             can_self_pickup=can_self_pickup,
             category_result=category_result,
             sku_config=uploaded_sku_config,
+            quantity=publish_quantity,
         )
 
         publish_res = await self._post_mtop(
@@ -582,6 +618,7 @@ class ItemPublisher:
         can_self_pickup: bool,
         category_result: Optional[Dict[str, Any]] = None,
         sku_config: Optional[Dict[str, Any]] = None,
+        quantity: int = DEFAULT_PUBLISH_QUANTITY,
     ) -> Dict[str, Any]:
         category_result = category_result or self._normalize_category_result(
             channel_res.get("data", {}).get("categoryPredictResult", {})
@@ -591,7 +628,7 @@ class ItemPublisher:
         payload = {
             "freebies": False,
             "itemTypeStr": "b",
-            "quantity": "1",
+            "quantity": str(int(quantity)),
             "simpleItem": "true",
             "imageInfoDOList": [
                 {
@@ -666,6 +703,103 @@ class ItemPublisher:
             )
 
         return payload
+
+    async def edit_item_quantity(
+        self,
+        *,
+        item_id: str,
+        item_fields: Dict[str, Any],
+        quantity: int = DEFAULT_PUBLISH_QUANTITY,
+    ) -> Dict[str, Any]:
+        """用全量字段改在售库存，保持原来的 item_id。缺图或缺类目时拒绝，不编造。"""
+        fields = item_fields or {}
+        quantity_value = normalize_publish_quantity(quantity)
+        title = sanitize_publish_text(str(fields.get("title") or "").strip())
+        description = sanitize_publish_text(str(fields.get("description") or title).strip())
+        if title != str(fields.get("title") or "").strip() or description != str(fields.get("description") or title).strip():
+            logger.info(f"【{self.cookie_id}】编辑文案已替换敏感词")
+
+        missing = []
+        if not str(item_id or "").strip():
+            missing.append("itemId")
+        if not title:
+            missing.append("title")
+        try:
+            price_value = float(fields.get("price"))
+        except (TypeError, ValueError):
+            price_value = None
+        if price_value is None or price_value < 0:
+            missing.append("price")
+        images = fields.get("images") or []
+        if not isinstance(images, list) or not images:
+            missing.append("images")
+        category_id = str(
+            fields.get("categoryId") or fields.get("category_id") or fields.get("channelCatId") or ""
+        ).strip()
+        if not category_id:
+            missing.append("categoryId")
+        if missing:
+            raise ValueError("修改在售库存需要全量字段，缺少: " + ", ".join(missing))
+
+        image_list = []
+        for image in images:
+            if isinstance(image, str):
+                url = image.strip()
+                width = 0
+                height = 0
+            elif isinstance(image, dict):
+                url = str(image.get("url") or image.get("image_url") or image.get("src") or "").strip()
+                width = image.get("widthSize") or image.get("width") or 0
+                height = image.get("heightSize") or image.get("height") or 0
+            else:
+                url = ""
+                width = 0
+                height = 0
+            if not url:
+                continue
+            image_list.append({
+                "extraInfo": {"isH": "false", "isT": "false", "raw": "false"},
+                "isQrCode": False,
+                "url": url,
+                "heightSize": height,
+                "widthSize": width,
+                "major": True,
+                "type": 0,
+                "status": "done",
+            })
+        if not image_list:
+            raise ValueError("修改在售库存需要全量字段，缺少: images")
+
+        item_cat = {
+            "catId": str(fields.get("catId") or category_id),
+            "channelCatId": str(fields.get("channelCatId") or category_id),
+        }
+        if fields.get("catName"):
+            item_cat["catName"] = str(fields.get("catName"))
+        if fields.get("tbCatId"):
+            item_cat["tbCatId"] = str(fields.get("tbCatId"))
+
+        payload = {
+            "itemId": str(item_id).strip(),
+            "quantity": str(quantity_value),
+            "itemTextDTO": {
+                "desc": description,
+                "title": title,
+                "titleDescSeparate": description != title,
+            },
+            "imageInfoDOList": image_list,
+            "itemCatDTO": item_cat,
+            "itemPriceDTO": {
+                "priceInCent": str(int(round(float(price_value) * 100))),
+            },
+        }
+        return await self._post_mtop(
+            api_name="mtop.idle.pc.idleitem.edit",
+            version="1.0",
+            payload=payload,
+            spm_cnt="a21ybx.publish.0.0",
+            spm_pre="a21ybx.home.sidebar.1.46413da6EPl7v5",
+        )
 
     def _apply_delivery_settings(
         self,

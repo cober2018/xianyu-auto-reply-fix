@@ -34,82 +34,8 @@ def main() -> int:
     parser.add_argument("--verification-wait-timeout", type=int, default=30, help="seconds to wait when QR/face verification is required")
     parser.add_argument("--keep-verification-screenshot", action="store_true", help="do not delete verification screenshot after the run")
     args = parser.parse_args()
-
-    if args.automation_backend != "auto":
-        os.environ["XY_SLIDER_AUTOMATION_BACKEND"] = args.automation_backend
-    if args.stealth_mode != "auto":
-        os.environ["XY_SLIDER_STEALTH_MODE"] = args.stealth_mode
-    os.environ["XY_VERIFICATION_WAIT_TIMEOUT"] = str(max(5, args.verification_wait_timeout))
-    if args.keep_verification_screenshot:
-        os.environ["XY_KEEP_VERIFICATION_SCREENSHOT"] = "1"
-
-    initial_cookie = ""
-    if args.initial_cookie:
-        initial_cookie = args.initial_cookie.strip().lstrip("\ufeff")
-    elif args.initial_cookie_file:
-        initial_cookie = _read_cookie_text(args.initial_cookie_file)
-
-    proxy = {
-        "proxy_type": args.proxy_type,
-        "proxy_host": args.proxy_host,
-        "proxy_port": args.proxy_port,
-        "proxy_user": args.proxy_user,
-        "proxy_pass": args.proxy_pass,
-    }
-
-    from utils.xianyu_slider_stealth import XianyuSliderStealth
-
-    headless = True if args.headless else not args.show_browser
-    print(f"account_id={args.account_id}")
-    print(f"headless={headless}")
-    print(f"automation_backend={os.environ.get('XY_SLIDER_AUTOMATION_BACKEND', 'auto')}")
-    print(f"stealth_mode={os.environ.get('XY_SLIDER_STEALTH_MODE', 'auto')}")
-    print(f"force_clean_context={args.force_clean_context}")
-    print(f"max_retries={args.max_retries}")
-    print(f"verification_wait_timeout={os.environ.get('XY_VERIFICATION_WAIT_TIMEOUT', '')}")
-    print(f"keep_verification_screenshot={bool(args.keep_verification_screenshot)}")
-
-    slider = XianyuSliderStealth(
-        user_id=args.account_id,
-        enable_learning=True,
-        headless=headless,
-        initial_cookies=initial_cookie,
-        proxy=proxy,
-        browser_channel=args.browser_channel,
-        executable_path=args.browser_path,
-        slider_max_retries=args.max_retries,
-    )
-    print(f"local_browser_info={slider.local_browser_info}")
-
-    def verification_callback(
-        message,
-        screenshot_path=None,
-        verification_url=None,
-        screenshot_path_new=None,
-        verification_type=None,
-        **kwargs,
-    ):
-        actual_screenshot_path = screenshot_path_new or screenshot_path or ""
-        print("verification_required=True")
-        print(f"verification_type={verification_type or ''}")
-        print(f"verification_screenshot={actual_screenshot_path}")
-        print(f"verification_url={verification_url or ''}")
-
-    result = slider.login_with_password_playwright(
-        account=args.account,
-        password=args.password,
-        show_browser=not headless,
-        force_clean_context=args.force_clean_context,
-        notification_callback=verification_callback,
-    )
-    success = bool(result)
-    print(f"success={success}")
-    print(f"last_login_error={getattr(slider, 'last_login_error', '')}")
-    if result:
-        print(f"cookie_count={len(result)}")
-        print(f"has_x5sec={'x5sec' in result}")
-    return 0 if success else 1
-
+    print("密码重登已关闭，请使用扫码登录", file=sys.stderr)
+    return 1
 
 if __name__ == "__main__":
     try:

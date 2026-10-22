@@ -86,6 +86,8 @@ RISK_CONTROL:
   auto_delivery_night_delay_range: [180, 900]
   # 拟人化：夜间窗口内自动回复延迟拉长(秒)，模拟卖家睡觉；白天 2~10 秒
   night_reply_delay_range: [60, 480]
+  # 自动滑块恢复默认关闭：pureCaptcha/RGV587 是纯黑处罚页，继续拉浏览器会被当成脚本升级封禁
+  auto_captcha_recovery_enabled: false
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟

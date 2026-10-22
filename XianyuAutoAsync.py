@@ -149,6 +149,34 @@ class InitAuthError(Exception):
     """WebSocket 已建立，但初始化鉴权失败。"""
 
 
+class MessageSendAckTimeoutError(Exception):
+    """私聊消息未在时限内收到服务端成功回执，或收到错误回执。"""
+
+
+SEND_ACK_TIMEOUT_SECONDS = 5.0
+
+
+def _send_ack_is_success(message_data) -> bool:
+    """只有回执 code 为 200 才算私聊发送成功。缺 code、非数字或非 200 都是失败。"""
+    if not isinstance(message_data, dict):
+        return False
+
+    candidates = [message_data.get("code")]
+    headers = message_data.get("headers")
+    if isinstance(headers, dict):
+        candidates.append(headers.get("code"))
+
+    for code in candidates:
+        if code is None or code == "":
+            continue
+        try:
+            if int(code) == 200:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 class AutoReplyPauseManager:
     """自动回复暂停管理器"""
     def __init__(self):
@@ -636,11 +664,55 @@ class XianyuLive:
         logger.info(f"【{self.cookie_id}】扫码登录稳定期已结束，恢复自动认证链路")
         return True
 
-    def _should_defer_auth_recovery_for_qr_grace(self, current_time: Optional[float] = None) -> bool:
+    def _is_auto_captcha_recovery_enabled(self) -> bool:
+        return bool(RISK_CONTROL.get('auto_captcha_recovery_enabled', False))
+
+    def _enter_fulfillment_priority(self) -> None:
+        self._fulfillment_priority_depth = getattr(self, "_fulfillment_priority_depth", 0) + 1
+
+    def _exit_fulfillment_priority(self) -> None:
+        self._fulfillment_priority_depth = max(0, getattr(self, "_fulfillment_priority_depth", 0) - 1)
+
+    def _account_has_pending_shipment(self) -> bool:
+        """是否有已付款仍待发货的订单。结果缓存 30 秒，避免稳定期检查打满 sqlite。"""
+        now = time.time()
+        cached_at = getattr(self, "_pending_shipment_probe_at", 0.0) or 0.0
+        if now - cached_at < 30 and hasattr(self, "_pending_shipment_probe_value"):
+            return bool(self._pending_shipment_probe_value)
+
+        has_pending = False
+        try:
+            from db_manager import db_manager
+            has_pending = bool(db_manager.has_pending_shipment(self.cookie_id))
+        except Exception as probe_error:
+            logger.debug(
+                f"【{self.cookie_id}】待发货探测失败，不因此放行扫码稳定期: {self._safe_str(probe_error)}"
+            )
+            has_pending = False
+
+        self._pending_shipment_probe_at = now
+        self._pending_shipment_probe_value = has_pending
+        return has_pending
+
+    def _should_defer_auth_recovery_for_qr_grace(
+        self,
+        current_time: Optional[float] = None,
+        *,
+        allow_fulfillment: bool = False,
+    ) -> bool:
         current_time = current_time or time.time()
         self._consume_qr_login_grace_period_if_expired(current_time)
         remaining = self._get_qr_login_grace_remaining_seconds(current_time)
         if remaining <= 0:
+            return False
+        if (
+            allow_fulfillment
+            or getattr(self, "_fulfillment_priority_depth", 0) > 0
+            or self._account_has_pending_shipment()
+        ):
+            logger.warning(
+                f"【{self.cookie_id}】履约发货优先放行，扫码登录稳定期剩余 {remaining} 秒不拦截认证恢复"
+            )
             return False
         self.last_token_refresh_status = "qr_login_grace_wait"
         self.last_token_refresh_error_message = f"扫码登录稳定期中，剩余{remaining}秒"
@@ -1995,6 +2067,9 @@ class XianyuLive:
         self.last_sent_heartbeat_mid = None
         self.pending_heartbeat_mids = deque(maxlen=32)
         self.lwp_response_waiters = {}
+        self._fulfillment_priority_depth = 0
+        self._pending_shipment_probe_at = 0.0
+        self._pending_shipment_probe_value = False
         self.heartbeat_task = None
         self.ws = None
         self.last_non_heartbeat_message_time = 0
@@ -4863,6 +4938,7 @@ class XianyuLive:
                     delivery_meta.get('card_description', '') if isinstance(delivery_meta, dict) else '',
                 )
 
+            self._enter_fulfillment_priority()
             try:
                 await self.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
 
@@ -4951,7 +5027,19 @@ class XianyuLive:
                     channel='auto',
                     rule_meta=delivery_meta,
                 )
+                try:
+                    await self.send_delivery_failure_notification(
+                        send_user_name="买家",
+                        send_user_id=buyer_id,
+                        item_id=item_id,
+                        error_message=f"私聊发货未确认送达，未执行平台发货: {self._safe_str(send_error)}",
+                        order_id=order_id,
+                    )
+                except Exception as notify_error:
+                    logger.error(f"【{self.cookie_id}】补偿发货失败通知发送异常: {self._safe_str(notify_error)}")
                 return False
+            finally:
+                self._exit_fulfillment_priority()
 
     async def _auto_deliver_recovered_pending_order(
         self,
@@ -5519,6 +5607,7 @@ class XianyuLive:
             msg_id: 消息ID
         """
         try:
+            self._enter_fulfillment_priority()
             logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 🚀 开始处理简化消息自动发货: order_id={order_id}, item_id={item_id}')
             
             # 检查商品是否属于当前账号
@@ -5736,6 +5825,7 @@ class XianyuLive:
 
                     # 发送发货内容
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
+                    chat_delivered = False
                     
                     try:
                         await self._send_delivery_steps(
@@ -5746,12 +5836,9 @@ class XianyuLive:
                             user_url=user_url,
                             log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 自动发货'
                         )
+                        chat_delivered = True
 
                         if not self._mark_data_reservation_sent_if_needed(delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta):
-                            self._release_data_reservation_if_needed(
-                                delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
-                                error='发送成功后标记预占已发送失败'
-                            )
                             raise Exception('批量数据预占标记已发送失败')
 
                         self._persist_delivery_finalization_state(
@@ -5836,16 +5923,74 @@ class XianyuLive:
                             rule_meta=delivery_rule_meta
                         )
                     except Exception as send_e:
-                        self._record_delivery_log(
-                            order_id=order_id,
-                            item_id=item_id,
-                            buyer_id=user_id,
-                            status='failed',
-                            reason=f'自动发货消息发送失败: {self._safe_str(send_e)}',
-                            channel='auto',
-                            rule_meta=delivery_rule_meta
-                        )
-                        raise
+                        if not chat_delivered:
+                            self._record_delivery_log(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                status='failed',
+                                reason=f'自动发货消息发送失败: {self._safe_str(send_e)}',
+                                channel='auto',
+                                rule_meta=delivery_rule_meta
+                            )
+                            try:
+                                await self.send_delivery_failure_notification(
+                                    send_user_name="买家",
+                                    send_user_id=user_id,
+                                    item_id=item_id,
+                                    error_message=f"私聊发货未确认送达，未执行平台发货: {self._safe_str(send_e)}",
+                                    chat_id=chat_id,
+                                    order_id=order_id
+                                )
+                            except Exception as notify_error:
+                                logger.error(
+                                    f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 发货失败通知发送异常: {self._safe_str(notify_error)}'
+                                )
+                            raise
+
+                        post_error = f"私聊发货已确认送达，但确认发货或落库失败: {self._safe_str(send_e)}"
+                        try:
+                            self._persist_delivery_finalization_state(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                                channel='auto',
+                                status='sent',
+                                last_error=post_error,
+                            )
+                        except Exception as persist_error:
+                            logger.error(
+                                f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 已送达后的发货状态落库失败: {self._safe_str(persist_error)}'
+                            )
+                        try:
+                            self._record_delivery_log(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                status='failed',
+                                reason=post_error,
+                                channel='auto',
+                                rule_meta=delivery_rule_meta
+                            )
+                        except Exception as log_error:
+                            logger.error(
+                                f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 已送达后的发货日志写入失败: {self._safe_str(log_error)}'
+                            )
+                        try:
+                            await self.send_delivery_failure_notification(
+                                send_user_name="买家",
+                                send_user_id=user_id,
+                                item_id=item_id,
+                                error_message=post_error,
+                                chat_id=chat_id,
+                                order_id=order_id
+                            )
+                        except Exception as notify_error:
+                            logger.error(
+                                f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 发货失败通知发送异常: {self._safe_str(notify_error)}'
+                            )
+                        return
                     
                     # 发送成功通知
                     await self.send_delivery_failure_notification(
@@ -5879,10 +6024,16 @@ class XianyuLive:
                     )
 
         except Exception as e:
-            self._release_data_reservation_if_needed(
-                delivery_result if 'delivery_result' in locals() and isinstance(delivery_result, dict) else delivery_rule_meta if 'delivery_rule_meta' in locals() else None,
-                error=f'自动发货发送失败: {self._safe_str(e)}'
-            )
+            delivered_before_error = 'chat_delivered' in locals() and chat_delivered
+            if delivered_before_error:
+                logger.error(
+                    f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 私聊已确认送达，异常发生在后续处理，不释放卡密预占: {self._safe_str(e)}'
+                )
+            else:
+                self._release_data_reservation_if_needed(
+                    delivery_result if 'delivery_result' in locals() and isinstance(delivery_result, dict) else delivery_rule_meta if 'delivery_rule_meta' in locals() else None,
+                    error=f'自动发货发送失败: {self._safe_str(e)}'
+                )
             self._record_delivery_log(
                 order_id=order_id,
                 item_id=item_id,
@@ -5894,6 +6045,8 @@ class XianyuLive:
             logger.error(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 简化消息自动发货异常: {self._safe_str(e)}')
             import traceback
             logger.error(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 异常堆栈: {traceback.format_exc()}')
+        finally:
+            self._exit_fulfillment_priority()
 
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str, message_data: dict = None):
@@ -5903,6 +6056,7 @@ class XianyuLive:
             message_data: 原始的WebSocket消息数据，用于提取订单ID时的备用搜索
         """
         try:
+            self._enter_fulfillment_priority()
             from db_manager import db_manager
 
             # 检查商品是否属于当前cookies
@@ -6427,6 +6581,8 @@ class XianyuLive:
                     send_groups = self._build_delivery_send_groups(prepared_units, quantity_to_send)
                     total_send_groups = len(send_groups)
 
+                    delivered_groups = []
+                    any_group_send_failed = False
                     for group_index, send_group in enumerate(send_groups, start=1):
                         group_units = send_group.get('units') or []
                         if not group_units:
@@ -6474,6 +6630,63 @@ class XianyuLive:
                                     rule_meta=unit_rule_meta
                                 )
                                 logger.error(last_delivery_error)
+                            try:
+                                await self.send_delivery_failure_notification(
+                                    send_user_name,
+                                    send_user_id,
+                                    item_id,
+                                    f"私聊发货未确认送达，未执行平台发货: {group_error}",
+                                    chat_id,
+                                    order_id=order_id
+                                )
+                            except Exception as notify_error:
+                                logger.error(f"多数量发货失败通知发送异常: {self._safe_str(notify_error)}")
+                            any_group_send_failed = True
+                            continue
+
+                        delivered_groups.append({
+                            'send_group': send_group,
+                            'is_batched_text_group': is_batched_text_group,
+                        })
+                        if total_send_groups > 1 and group_index < total_send_groups:
+                            await asyncio.sleep(1)
+
+                    for delivered in delivered_groups:
+                        send_group = delivered['send_group']
+                        group_units = send_group.get('units') or []
+                        is_batched_text_group = delivered['is_batched_text_group']
+                        if any_group_send_failed:
+                            for prepared_unit in group_units:
+                                unit_rule_meta = prepared_unit.get('rule_meta') or {}
+                                unit_index = prepared_unit.get('unit_index') or 1
+                                hold_error = (
+                                    f"第 {unit_index} 个卡券私聊已确认送达，但同订单另有卡券未送达，未执行平台发货"
+                                )
+                                if not self._mark_data_reservation_sent_if_needed(unit_rule_meta):
+                                    logger.error(
+                                        f"第 {unit_index} 个卡券已送达，但标记预占已发送失败，仍不释放卡密"
+                                    )
+                                self._persist_delivery_finalization_state(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=send_user_id,
+                                    delivery_meta=unit_rule_meta,
+                                    channel='auto',
+                                    status='sent',
+                                    last_error=hold_error,
+                                )
+                                last_delivery_error = hold_error
+                                self._record_delivery_log(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=send_user_id,
+                                    buyer_nick=send_user_name,
+                                    status='failed',
+                                    reason=hold_error,
+                                    channel='auto',
+                                    rule_meta=unit_rule_meta,
+                                )
+                                logger.error(hold_error)
                             continue
 
                         for prepared_unit in group_units:
@@ -6483,11 +6696,16 @@ class XianyuLive:
 
                             try:
                                 if not self._mark_data_reservation_sent_if_needed(unit_rule_meta):
-                                    self._release_data_reservation_if_needed(
-                                        unit_rule_meta,
-                                        error=f'发送成功后标记预占已发送失败(unit={unit_index})'
+                                    last_delivery_error = f'第 {unit_index} 个卡券已确认送达，但标记预占已发送失败，未释放卡密'
+                                    self._persist_delivery_finalization_state(
+                                        order_id=order_id,
+                                        item_id=item_id,
+                                        buyer_id=send_user_id,
+                                        delivery_meta=unit_rule_meta,
+                                        channel='auto',
+                                        status='sent',
+                                        last_error=last_delivery_error,
                                     )
-                                    last_delivery_error = f'第 {unit_index} 个卡券发送成功后标记预占已发送失败'
                                     self._record_delivery_log(
                                         order_id=order_id,
                                         item_id=item_id,
@@ -6602,9 +6820,6 @@ class XianyuLive:
                                 )
                                 logger.error(last_delivery_error)
 
-                        if total_send_groups > 1 and group_index < total_send_groups:
-                            await asyncio.sleep(1)
-
                     progress_summary = self._sync_order_delivery_progress(
                         order_id=order_id,
                         cookie_id=self.cookie_id,
@@ -6676,6 +6891,8 @@ class XianyuLive:
                 channel='auto'
             )
             logger.error(f"统一自动发货处理异常: {self._safe_str(e)}")
+        finally:
+            self._exit_fulfillment_priority()
 
 
 
@@ -7653,11 +7870,33 @@ class XianyuLive:
                         except Exception as log_e:
                             logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
 
+                        from utils.xianyu_slider_stealth import HardBlockCircuitError, feedback_is_hard_block
                         try:
                             # 尝试通过滑块验证获取新的cookies
                             captcha_start_time = time.time()
+                            if feedback_is_hard_block(res_json):
+                                raise HardBlockCircuitError("检测到 pureCaptcha/RGV587 硬拦截，停止自动滑块")
                             new_cookies_str = await self._handle_captcha_verification(res_json)
                             captcha_duration = time.time() - captcha_start_time
+                            if self.last_token_refresh_status == "captcha_recovery_disabled":
+                                if 'log_id' in locals() and log_id:
+                                    self._update_risk_log(
+                                        log_id,
+                                        session_id=captcha_session_id,
+                                        trigger_scene=captcha_trigger_scene,
+                                        result_code='captcha_recovery_disabled',
+                                        processing_result='自动滑块恢复已关闭，未启动浏览器',
+                                        processing_status='failed',
+                                        error_message=self.last_token_refresh_error_message or '自动滑块恢复已关闭',
+                                        duration_ms=max(0, int(captcha_duration * 1000)),
+                                        event_meta=self._build_risk_event_meta(
+                                            trigger_scene=captcha_trigger_scene,
+                                            verification_url=verification_url,
+                                            extra={'cookie_id': self.cookie_id},
+                                        ),
+                                    )
+                                notification_sent = True
+                                return None
 
                             if new_cookies_str:
                                 logger.info(f"【{self.cookie_id}】滑块验证成功，准备重启实例...")
@@ -7740,6 +7979,35 @@ class XianyuLive:
                                 
                                 # 标记已处理，避免后续再发送通用失败通知
                                 notification_sent = True
+                        except HardBlockCircuitError as captcha_e:
+                            hard_block_seconds = int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600)
+                            XianyuLive.set_password_login_failure_backoff(
+                                self.cookie_id, 'hard_block', hard_block_seconds
+                            )
+                            self.last_token_refresh_status = "hard_block"
+                            self.last_token_refresh_error_message = self._safe_str(captcha_e)
+                            logger.error(
+                                f"【{self.cookie_id}】命中 pureCaptcha/RGV587 硬拦截，停止自动滑块并冷却 {hard_block_seconds} 秒"
+                            )
+                            captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
+                            if 'log_id' in locals() and log_id:
+                                self._update_risk_log(
+                                    log_id,
+                                    session_id=captcha_session_id,
+                                    trigger_scene=captcha_trigger_scene,
+                                    result_code='hard_block',
+                                    processing_result='pureCaptcha/RGV587 硬拦截，已停止自动滑块',
+                                    processing_status='failed',
+                                    error_message=self._safe_str(captcha_e)[:200],
+                                    duration_ms=max(0, int(captcha_duration * 1000)),
+                                    event_meta=self._build_risk_event_meta(
+                                        trigger_scene=captcha_trigger_scene,
+                                        verification_url=verification_url,
+                                        extra={'cookie_id': self.cookie_id},
+                                    ),
+                                )
+                            notification_sent = True
+                            return None
                         except Exception as captcha_e:
                             logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
                             self._clear_pending_slider_success_notice("滑块验证处理异常")
@@ -7882,21 +8150,11 @@ class XianyuLive:
                                 )
 
                             refresh_success = False
-                            if allow_password_login_recovery:
-                                refresh_success = await self._try_password_login_refresh(
-                                    "令牌/Session过期",
-                                    risk_session_id=token_expired_session_id,
-                                    trigger_scene=token_trigger_scene,
-                                    ignore_slider_failed_backoff=recent_slider_success,
-                                )
-                            else:
-                                self.last_token_refresh_status = (
-                                    "session_expired_after_slider"
-                                    if recent_slider_success else
-                                    "session_expired_preflight"
-                                )
-                                self.last_token_refresh_error_message = f"Token预检返回{expire_type}"
-                                logger.warning(f"【{self.cookie_id}】当前为预检模式，跳过密码登录恢复，直接返回Token刷新失败")
+                            self.last_token_refresh_status = "password_login_removed"
+                            self.last_token_refresh_error_message = "密码重登已关闭，请使用扫码登录"
+                            logger.warning(
+                                f"【{self.cookie_id}】令牌/Session过期，密码重登已关闭，请扫码登录"
+                            )
                             
                             if token_expired_log_id:
                                 self._update_risk_log(
@@ -8085,6 +8343,15 @@ class XianyuLive:
                 )
                 return None
 
+            from utils.xianyu_slider_stealth import HardBlockCircuitError, feedback_is_hard_block
+            if feedback_is_hard_block(res_json):
+                raise HardBlockCircuitError("检测到 pureCaptcha/RGV587 硬拦截，停止自动滑块")
+            if not self._is_auto_captcha_recovery_enabled():
+                self.last_token_refresh_status = "captcha_recovery_disabled"
+                self.last_token_refresh_error_message = "自动滑块恢复已关闭，停止拉起浏览器"
+                logger.warning(f"【{self.cookie_id}】自动滑块恢复已关闭，不启动浏览器，也不写入密码重登退避")
+                return None
+
             # 获取验证URL
             verification_url = None
 
@@ -8107,9 +8374,8 @@ class XianyuLive:
                 from utils.slider_orchestrator import run_slider_async_with_fallback
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
-                # 读取账号配置以决定浏览器模式（默认无头）
-                account_info = db_manager.get_cookie_details(self.cookie_id) or {}
-                show_browser = bool(account_info.get('show_browser', False))
+                # 自动滑块一律无头。账号 show_browser 只留给用户主动发起的密码登录，
+                # 避免风控恢复弹出有头 Chrome 卡住桌面。
                 # 在启动浏览器前记录 Token 请求链路的出口 IP。滑块浏览器启动后会
                 # 再探测一次；两者不一致时延迟验证，避免跨出口使用绑定的 x5secdata。
                 expected_outbound_ip = await self._probe_token_request_outbound_ip()
@@ -8118,7 +8384,7 @@ class XianyuLive:
                 slider_stealth = XianyuSliderStealth(
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=resolve_headless_flag(show_browser),
+                    headless=True,
                     initial_cookies=self.cookies_str,
                     proxy=self.proxy_config,
                     use_account_persistent_profile=True,
@@ -8255,6 +8521,8 @@ class XianyuLive:
                         )
                     return None
 
+            except HardBlockCircuitError:
+                raise
             except ImportError as import_e:
                 logger.error(f"【{self.cookie_id}】XianyuSliderStealth导入失败: {import_e}")
                 logger.error(f"【{self.cookie_id}】请安装Playwright库: pip install playwright")
@@ -8297,6 +8565,8 @@ class XianyuLive:
 
 
 
+        except HardBlockCircuitError:
+            raise
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理滑块验证时出错: {self._safe_str(e)}")
             return None
@@ -8464,519 +8734,14 @@ class XianyuLive:
         trigger_scene: Optional[str] = None,
         ignore_slider_failed_backoff: bool = False,
     ):
-        """尝试通过密码登录刷新Cookie并重启实例
-        
-        Args:
-            trigger_reason: 触发原因，用于日志记录
-            
-        Returns:
-            bool: 是否成功刷新Cookie
-        """
-        logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
-        trigger_scene = trigger_scene or self._normalize_risk_trigger_scene(trigger_reason, default='auto_cookie_refresh')
-        risk_session_id = risk_session_id or self._new_risk_session_id('cookie')
-        risk_log_started_at = time.time()
-        base_event_meta = {'cookie_id': self.cookie_id, 'trigger_reason': trigger_reason}
-
-        # 记录到风控日志
-        refresh_risk_log_id = None
-        try:
-            stale_count = db_manager.mark_stale_risk_control_logs_failed(timeout_minutes=15, cookie_id=self.cookie_id)
-            if stale_count > 0:
-                logger.warning(f"【{self.cookie_id}】检测到{stale_count}条超时processing风控日志，已自动标记failed")
-            refresh_risk_log_id = self._create_risk_log(
-                event_type='cookie_refresh',
-                session_id=risk_session_id,
-                trigger_scene=trigger_scene,
-                result_code='cookie_refresh_started',
-                event_description=f"{trigger_reason}触发Cookie刷新",
-                processing_status='processing',
-                event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-            )
-        except Exception as log_e:
-            logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
-
-        if self.is_manual_refresh_active(self.cookie_id, allow_handoff_recovery=True):
-            logger.warning(f"【{self.cookie_id}】手动刷新进行中，跳过自动密码登录刷新")
-            if refresh_risk_log_id:
-                self._update_risk_log(
-                    refresh_risk_log_id,
-                    session_id=risk_session_id,
-                    trigger_scene=trigger_scene,
-                    result_code='manual_refresh_active',
-                    processing_status='failed',
-                    error_message='手动刷新进行中，自动密码登录刷新已跳过',
-                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                )
-            return False
-
-        if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
-            logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，跳过自动密码登录刷新")
-            if refresh_risk_log_id:
-                self._update_risk_log(
-                    refresh_risk_log_id,
-                    session_id=risk_session_id,
-                    trigger_scene=trigger_scene,
-                    result_code='account_pause_active',
-                    processing_status='failed',
-                    error_message='账号处于人工验证/风控暂停状态，自动密码登录刷新已跳过',
-                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                )
-            return False
-
-        if self._should_defer_auth_recovery_for_qr_grace():
-            logger.warning(f"【{self.cookie_id}】扫码登录稳定期内，跳过自动密码登录刷新")
-            if refresh_risk_log_id:
-                self._update_risk_log(
-                    refresh_risk_log_id,
-                    session_id=risk_session_id,
-                    trigger_scene=trigger_scene,
-                    result_code='qr_login_grace_active',
-                    processing_status='failed',
-                    error_message=self.last_token_refresh_error_message or '扫码登录稳定期内，自动密码登录刷新已跳过',
-                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                )
-            return False
-
-        recovery_lock_owner = f"{self.cookie_id}:{trigger_scene or 'auto_cookie_refresh'}:{int(time.time() * 1000)}"
-        recovery_lock_acquired = False
-
-        # 检查是否在密码登录冷却期内，避免重复登录
-        current_time = time.time()
-        failure_backoff = self._get_active_password_login_failure_backoff(current_time)
-        if failure_backoff:
-            backoff_reason = failure_backoff.get('reason', 'unknown')
-            remaining_time = failure_backoff.get('remaining_time', 0.0)
-            if backoff_reason == 'slider_failed' and ignore_slider_failed_backoff:
-                logger.warning(
-                    f"【{self.cookie_id}】检测到最近刚通过滑块，忽略一次旧的 slider_failed 退避并继续尝试密码登录刷新"
-                )
-                XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
-                failure_backoff = None
-            else:
-                logger.warning(
-                    f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），还需等待 {remaining_time:.1f} 秒"
-                )
-                if refresh_risk_log_id:
-                    self._update_risk_log(
-                        refresh_risk_log_id,
-                        session_id=risk_session_id,
-                        trigger_scene=trigger_scene,
-                        result_code='password_login_backoff',
-                        processing_status='failed',
-                        error_message=f"密码登录失败退避中，剩余{remaining_time:.1f}秒",
-                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                        event_meta=self._build_risk_event_meta(
-                            trigger_scene=trigger_scene,
-                            extra={**base_event_meta, 'backoff_reason': backoff_reason, 'backoff_seconds': failure_backoff.get('seconds')},
-                        ),
-                    )
-                return False
-
-        last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
-        time_since_last_login = current_time - last_password_login
-        
-        if last_password_login > 0 and time_since_last_login < XianyuLive._password_login_cooldown:
-            remaining_time = XianyuLive._password_login_cooldown - time_since_last_login
-            logger.warning(f"【{self.cookie_id}】距离上次密码登录仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录")
-            logger.warning(f"【{self.cookie_id}】提示：如果新Cookie仍然无效，请检查账号状态或手动更新Cookie")
-            if refresh_risk_log_id:
-                self._update_risk_log(
-                    refresh_risk_log_id,
-                    session_id=risk_session_id,
-                    trigger_scene=trigger_scene,
-                    result_code='password_login_cooldown',
-                    processing_status='failed',
-                    error_message=f"密码登录冷却期内，剩余{remaining_time:.1f}秒",
-                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                )
-            return False
-
-        recovery_lock_acquired, existing_lock = XianyuLive.acquire_auth_recovery_lock(
-            self.cookie_id,
-            recovery_lock_owner,
+        """密码重登已关闭。闲鱼账号恢复只允许扫码登录，这里绝不打开浏览器。"""
+        del risk_session_id, trigger_scene, ignore_slider_failed_backoff
+        self.last_token_refresh_status = "password_login_removed"
+        self.last_token_refresh_error_message = "密码重登已关闭，请使用扫码登录"
+        logger.warning(
+            f"【{self.cookie_id}】密码重登已关闭（触发原因: {trigger_reason}），请使用扫码登录，不会打开浏览器"
         )
-        if not recovery_lock_acquired:
-            existing_owner = (existing_lock or {}).get('owner', 'unknown')
-            logger.warning(f"【{self.cookie_id}】认证恢复流程已在执行中，跳过本次重复触发: owner={existing_owner}")
-            if refresh_risk_log_id:
-                self._update_risk_log(
-                    refresh_risk_log_id,
-                    session_id=risk_session_id,
-                    trigger_scene=trigger_scene,
-                    result_code='auth_recovery_in_progress',
-                    processing_status='failed',
-                    error_message='已有认证恢复流程执行中',
-                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                    event_meta=self._build_risk_event_meta(
-                        trigger_scene=trigger_scene,
-                        extra={**base_event_meta, 'active_owner': existing_owner},
-                    ),
-                )
-            return False
-
-        # 记录到日志文件
-        log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
-            f"检测到{trigger_reason}，准备刷新Cookie并重启实例")
-
-        try:
-            # 从数据库获取账号登录信息
-            account_info = db_manager.get_cookie_details(self.cookie_id)
-
-            if not account_info:
-                logger.error(f"【{self.cookie_id}】无法获取账号信息")
-                self.last_token_refresh_error_message = "无法获取账号信息"
-                if refresh_risk_log_id:
-                    self._update_risk_log(
-                        refresh_risk_log_id,
-                        session_id=risk_session_id,
-                        trigger_scene=trigger_scene,
-                        result_code='account_info_missing',
-                        processing_status='failed',
-                        error_message='无法获取账号信息',
-                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                        event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                    )
-                return False
-
-            # 【重要】先检查数据库中的cookie是否已经更新
-            # 如果用户已经手动更新了cookie，就不需要触发密码登录刷新
-            db_cookie_value = account_info.get('cookie_value', '')
-            if db_cookie_value and db_cookie_value != self.cookies_str:
-                logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                self._set_runtime_cookie_state(cookies_str=db_cookie_value, source="db_cookie_reload_before_password_login")
-                logger.info(f"【{self.cookie_id}】Cookie已从数据库重新加载，跳过密码登录刷新")
-                if refresh_risk_log_id:
-                    self._update_risk_log(
-                        refresh_risk_log_id,
-                        session_id=risk_session_id,
-                        trigger_scene=trigger_scene,
-                        result_code='cookie_already_updated',
-                        processing_status='success',
-                        processing_result='检测到数据库Cookie已更新，自动刷新流程跳过',
-                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                        event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                    )
-                return True
-            
-            username = account_info.get('username', '')
-            password = account_info.get('password', '')
-            show_browser = account_info.get('show_browser', False)
-            
-            # 检查是否配置了用户名和密码
-            if not username or not password:
-                logger.warning(f"【{self.cookie_id}】未配置用户名或密码，跳过密码登录刷新")
-                self.last_token_refresh_error_message = "未配置用户名或密码，无法自动刷新Cookie"
-                await self.send_token_refresh_notification(
-                    f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
-                    "no_credentials"
-                )
-                if refresh_risk_log_id:
-                    self._update_risk_log(
-                        refresh_risk_log_id,
-                        session_id=risk_session_id,
-                        trigger_scene=trigger_scene,
-                        result_code='missing_credentials',
-                        processing_status='failed',
-                        error_message='未配置用户名或密码，无法自动刷新Cookie',
-                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                        event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                    )
-                return False
-            
-            # 使用集成的 Playwright 登录方法（无需猴子补丁）
-            from utils.xianyu_slider_stealth import XianyuSliderStealth
-            browser_mode = "有头" if show_browser else "无头"
-            logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
-            logger.info(f"【{self.cookie_id}】使用账号: {username}")
-            
-            # 创建一个通知回调包装函数，支持接收截图路径和验证链接
-            async def notification_callback_wrapper(
-                message: str,
-                screenshot_path: str = None,
-                verification_url: str = None,
-                verification_type: str = None,
-            ):
-                """通知回调包装函数，支持接收截图路径和验证链接"""
-                verification_context = 'manual_cookie_refresh' if self.is_manual_refresh_active(self.cookie_id, allow_handoff_recovery=True) else 'auto_refresh'
-                should_pause_account = self._should_pause_for_manual_verification(verification_type, verification_context)
-                self.last_token_refresh_status = 'verification_pending_manual' if not should_pause_account else 'manual_verification_required'
-                self.last_token_refresh_error_message = str(message or '').strip()
-                pause_target_loop = None
-                try:
-                    from cookie_manager import manager as cookie_manager_manager
-                    pause_target_loop = getattr(cookie_manager_manager, 'loop', None)
-                except Exception:
-                    pause_target_loop = None
-
-                current_loop = None
-                try:
-                    current_loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    current_loop = None
-
-                if pause_target_loop and pause_target_loop.is_running() and pause_target_loop is not current_loop:
-                    pause_future = asyncio.run_coroutine_threadsafe(
-                        self._pause_account_for_manual_verification(
-                            verification_type=verification_type,
-                            error_message=message,
-                            pause_account=should_pause_account,
-                            verification_context=verification_context,
-                            verification_url=verification_url or '',
-                        ),
-                        pause_target_loop,
-                    )
-                    try:
-                        pause_future.result(timeout=10)
-                    except Exception as pause_e:
-                        logger.warning(f"【{self.cookie_id}】跨线程暂停人工验证账号失败: {self._safe_str(pause_e)}")
-                else:
-                    await self._pause_account_for_manual_verification(
-                        verification_type=verification_type,
-                        error_message=message,
-                        pause_account=should_pause_account,
-                        verification_context=verification_context,
-                        verification_url=verification_url or '',
-                    )
-
-                await self.send_token_refresh_notification(
-                    error_message=message,
-                    notification_type="token_refresh",
-                    chat_id=None,
-                    attachment_path=screenshot_path,
-                    verification_url=verification_url,
-                    verification_type=verification_type,
-                )
-                if should_pause_account:
-                    await self._request_stop_after_account_pause(
-                        f"检测到需要人工完成的{verification_type or 'manual_verification'}"
-                    )
-            
-            # 在单独的线程中运行同步的登录方法
-            import asyncio
-            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=True, headless=resolve_headless_flag(show_browser))
-            slider.risk_session_id = risk_session_id
-            slider.risk_trigger_scene = trigger_scene
-            result = await slider._run_sync_method_on_fresh_thread(
-                slider.login_with_password_playwright,
-                account=username,
-                password=password,
-                show_browser=show_browser,
-                notification_callback=notification_callback_wrapper,
-                force_clean_context=True,
-            )
-            
-            if result:
-                logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
-                logger.info(f"【{self.cookie_id}】Cookie内容: {result}")
-                XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
-                
-                # 打印密码登录获取的Cookie字段详情
-                logger.info(f"【{self.cookie_id}】========== 密码登录Cookie字段详情 ==========")
-                logger.info(f"【{self.cookie_id}】Cookie字段数: {len(result)}")
-                logger.info(f"【{self.cookie_id}】Cookie字段列表:")
-                for i, (key, value) in enumerate(result.items(), 1):
-                    if len(str(value)) > 50:
-                        logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
-                    else:
-                        logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {value}")
-                
-                # 检查关键字段
-                important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
-                logger.info(f"【{self.cookie_id}】关键字段检查:")
-                for key in important_keys:
-                    if key in result:
-                        val = result[key]
-                        logger.info(f"【{self.cookie_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
-                    else:
-                        logger.info(f"【{self.cookie_id}】  ❌ {key}: 缺失")
-                logger.info(f"【{self.cookie_id}】==========================================")
-                
-                # 将cookie字典转换为字符串格式
-                new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
-                logger.info(f"【{self.cookie_id}】Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
-
-                # 🔒 落库前硬闸门：结构校验 + 真实 token 预检。
-                # 残缺(缺 _m_h5_tk 等)或错域的 Cookie 落库会触发 CookieManager
-                # 立即重启实例，新实例 token 必然失败，再走 59 秒冷静期→再次完整
-                # 密码登录，形成每分钟一次登录+滑块的自激振荡(2026-10-09 生产实测)。
-                gate_missing_fields = [
-                    key for key in REQUIRED_SESSION_COOKIE_FIELDS
-                    if not str(result.get(key) or '').strip()
-                ]
-                gate_error = ''
-                if gate_missing_fields:
-                    gate_error = f"密码登录Cookie缺少核心字段: {', '.join(gate_missing_fields)}"
-                else:
-                    token_usable, token_reason = await self._verify_new_cookie_token_usable(new_cookies_str)
-                    if not token_usable:
-                        gate_error = f"密码登录后Token预检未通过: {token_reason or '未知原因'}"
-
-                if gate_error:
-                    logger.error(f"【{self.cookie_id}】❌ {gate_error}，拒绝落库并进入退避(阻断重启自激振荡)")
-                    XianyuLive.set_password_login_failure_backoff('cookie_incomplete', 300)
-                    self.last_token_refresh_status = 'cookie_incomplete'
-                    self.last_token_refresh_error_message = gate_error
-                    await self.send_token_refresh_notification(
-                        f"密码登录成功但{gate_error}，已拒绝落库防止重启循环，300秒后重试",
-                        "token_refresh"
-                    )
-                    if refresh_risk_log_id:
-                        self._update_risk_log(
-                            refresh_risk_log_id,
-                            session_id=risk_session_id,
-                            trigger_scene=trigger_scene,
-                            result_code='cookie_incomplete',
-                            processing_status='failed',
-                            error_message=gate_error,
-                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                        )
-                    return False
-
-                # 记录密码登录时间，防止重复登录
-                XianyuLive._last_password_login_time[self.cookie_id] = time.time()
-                logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
-                await self._clear_account_pause_state("密码登录刷新成功")
-                self.last_token_refresh_status = 'cookie_refresh_success'
-                self.last_token_refresh_error_message = ''
-                
-                # ⚠️ 先发送通知，再更新cookies并重启任务
-                # 因为重启后当前任务会被取消，不能在重启后发送通知
-                try:
-                    await self.send_token_refresh_notification(
-                        f"账号密码登录成功，Cookie已获取，准备更新并重启",
-                        "cookie_refresh_success"
-                    )
-                except Exception as notify_e:
-                    logger.warning(f"【{self.cookie_id}】发送通知失败: {self._safe_str(notify_e)}")
-                
-                # 更新cookies并重启任务
-                update_success = await self._update_cookies_and_restart(new_cookies_str)
-                
-                if update_success:
-                    logger.info(f"【{self.cookie_id}】Cookie更新并重启任务成功")
-                    # 更新风控日志状态为成功
-                    if refresh_risk_log_id:
-                        self._update_risk_log(
-                            refresh_risk_log_id,
-                            session_id=risk_session_id,
-                            trigger_scene=trigger_scene,
-                            result_code='cookie_refresh_success',
-                            processing_status='success',
-                            processing_result='密码登录刷新Cookie成功，实例已重启',
-                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                        )
-                    return True
-                else:
-                    logger.error(f"【{self.cookie_id}】Cookie更新失败")
-                    if refresh_risk_log_id:
-                        self._update_risk_log(
-                            refresh_risk_log_id,
-                            session_id=risk_session_id,
-                            trigger_scene=trigger_scene,
-                            result_code='cookie_save_failed',
-                            processing_status='failed',
-                            error_message='Cookie获取成功但更新到数据库失败',
-                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                        )
-                    return False
-                    
-            else:
-                login_error = getattr(slider, 'last_login_error', '') or "密码登录失败，未获取到Cookie"
-                self.last_token_refresh_error_message = login_error
-                if await self._protect_account_from_risk_login_retry(login_error):
-                    if refresh_risk_log_id:
-                        self._update_risk_log(
-                            refresh_risk_log_id,
-                            session_id=risk_session_id,
-                            trigger_scene=trigger_scene,
-                            result_code='account_risk_protected',
-                            processing_status='failed',
-                            error_message=login_error[:200],
-                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                            event_meta=self._build_risk_event_meta(
-                                trigger_scene=trigger_scene,
-                                extra={**base_event_meta, 'status_note': '风控保护中'},
-                            ),
-                        )
-                    await self._request_stop_after_account_pause("检测到账号高风险登录提示")
-                    return False
-                backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(login_error)
-                XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
-                protected = await self._protect_account_for_consecutive_failures(
-                    XianyuLive.get_password_login_failure_backoff(self.cookie_id)
-                )
-                logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie: {login_error}")
-                logger.warning(f"【{self.cookie_id}】已进入失败退避期: {backoff_reason}, {backoff_seconds}秒")
-                if protected:
-                    return False
-                if refresh_risk_log_id:
-                    self._update_risk_log(
-                        refresh_risk_log_id,
-                        session_id=risk_session_id,
-                        trigger_scene=trigger_scene,
-                        result_code=f'password_login_{backoff_reason}',
-                        processing_status='failed',
-                        error_message=login_error[:200],
-                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                        event_meta=self._build_risk_event_meta(
-                            trigger_scene=trigger_scene,
-                            extra={**base_event_meta, 'backoff_reason': backoff_reason, 'backoff_seconds': backoff_seconds},
-                        ),
-                    )
-                return False
-
-        except Exception as refresh_e:
-            if await self._protect_account_from_risk_login_retry(str(refresh_e)):
-                if refresh_risk_log_id:
-                    self._update_risk_log(
-                        refresh_risk_log_id,
-                        session_id=risk_session_id,
-                        trigger_scene=trigger_scene,
-                        result_code='account_risk_protected',
-                        processing_status='failed',
-                        error_message=str(refresh_e)[:200],
-                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                        event_meta=self._build_risk_event_meta(
-                            trigger_scene=trigger_scene,
-                            extra={**base_event_meta, 'status_note': '风控保护中'},
-                        ),
-                    )
-                await self._request_stop_after_account_pause("检测到账号高风险登录异常")
-                return False
-            self.last_token_refresh_error_message = self._safe_str(refresh_e)
-            backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(str(refresh_e))
-            XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
-            protected = await self._protect_account_for_consecutive_failures(
-                XianyuLive.get_password_login_failure_backoff(self.cookie_id)
-            )
-            logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
-            import traceback
-            logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
-            if protected:
-                return False
-            if refresh_risk_log_id:
-                self._update_risk_log(
-                    refresh_risk_log_id,
-                    session_id=risk_session_id,
-                    trigger_scene=trigger_scene,
-                    result_code='cookie_refresh_exception',
-                    processing_status='failed',
-                    error_message=str(refresh_e)[:200],
-                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
-                )
-            return False
-        finally:
-            if recovery_lock_acquired:
-                XianyuLive.release_auth_recovery_lock(self.cookie_id, recovery_lock_owner)
+        return False
 
     async def _verify_cookie_validity(self) -> dict:
         """验证Cookie的有效性，通过实际调用API测试
@@ -13276,17 +13041,19 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def send_msg(self, ws, cid, toid, text):
-        text = {
+        """发送一条私聊文本，并等待这条 mid 的服务端成功回执。未确认送达则抛错，调用方不得点发货。"""
+        text_payload = {
             "contentType": 1,
             "text": {
                 "text": text
             }
         }
-        text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
+        text_base64 = str(base64.b64encode(json.dumps(text_payload).encode('utf-8')), 'utf-8')
+        mid = generate_mid()
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": mid
             },
             "body": [
                 {
@@ -13319,7 +13086,62 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        raw_message = json.dumps(msg)
+        if ws is self.ws:
+            response = await self._await_lwp_ack_on_shared_socket(ws, mid, raw_message)
+        else:
+            response = await self._await_lwp_ack_on_dedicated_socket(ws, mid, raw_message)
+        if not _send_ack_is_success(response):
+            code = None
+            if isinstance(response, dict):
+                code = response.get("code")
+                headers = response.get("headers")
+                if code is None and isinstance(headers, dict):
+                    code = headers.get("code")
+            raise MessageSendAckTimeoutError(f"私聊消息未收到成功回执 mid={mid} code={code}")
+        return True
+
+    async def _await_lwp_ack_on_shared_socket(self, ws, mid: str, raw_message: str, timeout: float = None):
+        """主连接的回执由接收循环写入 lwp_response_waiters，发送协程只等自己的 mid。"""
+        wait_timeout = SEND_ACK_TIMEOUT_SECONDS if timeout is None else timeout
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.lwp_response_waiters[mid] = future
+        try:
+            await ws.send(raw_message)
+            return await asyncio.wait_for(future, timeout=wait_timeout)
+        except asyncio.TimeoutError as exc:
+            raise MessageSendAckTimeoutError(f"私聊消息回执超时 mid={mid}") from exc
+        finally:
+            current = self.lwp_response_waiters.pop(mid, None)
+            if current and not current.done():
+                current.cancel()
+
+    async def _await_lwp_ack_on_dedicated_socket(self, ws, mid: str, raw_message: str, timeout: float = None):
+        """独立连接没有主接收循环。发送后必须自己读，直到对上 mid，否则会和外层 async for 互相等死。"""
+        wait_timeout = SEND_ACK_TIMEOUT_SECONDS if timeout is None else timeout
+        await ws.send(raw_message)
+        deadline = time.monotonic() + wait_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MessageSendAckTimeoutError(f"私聊消息回执超时 mid={mid}")
+            try:
+                raw_frame = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise MessageSendAckTimeoutError(f"私聊消息回执超时 mid={mid}") from exc
+            try:
+                if isinstance(raw_frame, (bytes, bytearray)):
+                    raw_frame = raw_frame.decode("utf-8", errors="ignore")
+                message_data = json.loads(raw_frame) if isinstance(raw_frame, str) else raw_frame
+            except Exception:
+                continue
+            if not isinstance(message_data, dict):
+                continue
+            headers = message_data.get("headers") or {}
+            if str(headers.get("mid") or "") != str(mid):
+                continue
+            return message_data
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -14115,21 +13937,11 @@ class XianyuLive:
                         if not validation_result['valid']:
                             logger.warning(f"【{self.cookie_id}】❌ Cookie验证失败: {validation_result['details']}")
                             if validation_result.get('relogin_recommended', True):
-                                logger.warning(f"【{self.cookie_id}】检测到Cookie可能无法用于关键API，尝试通过密码登录重新获取...")
-                                
-                                # 触发密码登录刷新
-                                password_refresh_success = await self._try_password_login_refresh("Cookie验证失败(关键API不可用)")
-                                
-                                if password_refresh_success:
-                                    logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，Cookie已更新")
-                                    clear_message_received_flag = True
-                                else:
-                                    logger.warning(f"【{self.cookie_id}】⚠️ 密码登录刷新失败，Cookie可能仍然无效")
-                                    # 发送通知
-                                    await self.send_token_refresh_notification(
-                                        f"Cookie验证失败且密码登录刷新也失败\n验证详情: {validation_result['details']}",
-                                        "cookie_validation_failed"
-                                    )
+                                logger.warning(f"【{self.cookie_id}】检测到Cookie可能无法用于关键API。密码重登已关闭，请扫码登录")
+                                await self.send_token_refresh_notification(
+                                    f"Cookie验证失败，密码重登已关闭，请扫码登录\n验证详情: {validation_result['details']}",
+                                    "cookie_validation_failed"
+                                )
                             else:
                                 logger.warning(f"【{self.cookie_id}】Cookie验证失败，但当前错误更像网络/环境问题，跳过密码登录刷新")
                         else:
@@ -15290,6 +15102,7 @@ class XianyuLive:
         logger.info(f"【{self.cookie_id}】开始单次发送消息: toid={toid}, item_id={item_id}")
 
         # 兼容不同版本的websockets库
+        result = False
         try:
             async with websockets.connect(
                 self.base_url,
@@ -15300,7 +15113,7 @@ class XianyuLive:
                 if result:
                     logger.info(f"【{self.cookie_id}】单次发送消息成功")
                 else:
-                    raise Exception("消息发送失败")
+                    raise MessageSendAckTimeoutError("单次发送消息未收到成功回执")
         except TypeError as e:
             # 安全地检查异常信息
             error_msg = self._safe_str(e)
@@ -15317,12 +15130,14 @@ class XianyuLive:
                     if result:
                         logger.info(f"【{self.cookie_id}】单次发送消息成功(兼容模式)")
                     else:
-                        raise Exception("消息发送失败")
+                        raise MessageSendAckTimeoutError("单次发送消息未收到成功回执")
             else:
                 raise
-        except websockets.exceptions.ConnectionClosedError as e:
-            logger.warning(f"【{self.cookie_id}】WebSocket连接关闭: {self._safe_str(e)}")
-            # 连接关闭但消息可能已发送，不抛出异常
+        except websockets.exceptions.ConnectionClosed as e:
+            if not result:
+                logger.warning(f"【{self.cookie_id}】连接在收到回执前关闭: {self._safe_str(e)}")
+                raise MessageSendAckTimeoutError(f"连接在收到回执前关闭: {self._safe_str(e)}") from e
+            logger.warning(f"【{self.cookie_id}】回执已确认后连接关闭: {self._safe_str(e)}")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】单次发送消息异常: {self._safe_str(e)}")
             raise
@@ -15333,6 +15148,7 @@ class XianyuLive:
 
         logger.info(f"【{self.cookie_id}】开始单次发送发货步骤: toid={toid}, item_id={item_id}, steps={len(delivery_steps or [])}")
 
+        result = False
         try:
             async with websockets.connect(
                 self.base_url,
@@ -15343,7 +15159,7 @@ class XianyuLive:
                 if result:
                     logger.info(f"【{self.cookie_id}】单次发送发货步骤成功")
                 else:
-                    raise Exception("发货步骤发送失败")
+                    raise MessageSendAckTimeoutError("单次发送发货步骤未收到成功回执")
         except TypeError as e:
             error_msg = self._safe_str(e)
 
@@ -15358,11 +15174,14 @@ class XianyuLive:
                     if result:
                         logger.info(f"【{self.cookie_id}】单次发送发货步骤成功(兼容模式)")
                     else:
-                        raise Exception("发货步骤发送失败")
+                        raise MessageSendAckTimeoutError("单次发送发货步骤未收到成功回执")
             else:
                 raise
-        except websockets.exceptions.ConnectionClosedError as e:
-            logger.warning(f"【{self.cookie_id}】WebSocket连接关闭: {self._safe_str(e)}")
+        except websockets.exceptions.ConnectionClosed as e:
+            if not result:
+                logger.warning(f"【{self.cookie_id}】连接在收到回执前关闭: {self._safe_str(e)}")
+                raise MessageSendAckTimeoutError(f"连接在收到回执前关闭: {self._safe_str(e)}") from e
+            logger.warning(f"【{self.cookie_id}】回执已确认后连接关闭: {self._safe_str(e)}")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】单次发送发货步骤异常: {self._safe_str(e)}")
             raise
@@ -15397,6 +15216,9 @@ class XianyuLive:
                     return True
                 except KeyError:
                     continue
+                except MessageSendAckTimeoutError as ack_error:
+                    logger.error(f"【{self.cookie_id}】私聊发货未收到成功回执: {self._safe_str(ack_error)}")
+                    return False
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】处理消息异常: {self._safe_str(e)}")
                     continue
@@ -15550,6 +15372,9 @@ class XianyuLive:
                 except KeyError:
                     # 消息格式不符合预期，继续等待
                     continue
+                except MessageSendAckTimeoutError as ack_error:
+                    logger.error(f"【{self.cookie_id}】私聊消息未收到成功回执: {self._safe_str(ack_error)}")
+                    return False
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】处理消息异常: {self._safe_str(e)}")
                     continue
@@ -17041,7 +16866,9 @@ class XianyuLive:
                                     del self.yifan_account_waiting[chat_id]
                                     
                                     # 继续执行亦凡API调用（带账号）
+                                    chat_delivered = False
                                     try:
+                                        self._enter_fulfillment_priority()
                                         if self._check_buyer_blacklist_for_action(
                                             buyer_id=send_user_id,
                                             item_id=item_id_saved,
@@ -17071,6 +16898,7 @@ class XianyuLive:
                                                 delivery_steps,
                                                 log_prefix=f"亦凡账号确认发货 order_id={order_id_saved or 'unknown'}"
                                             )
+                                            chat_delivered = True
 
                                             finalize_result = await self._finalize_delivery_after_send(
                                                 delivery_meta={
@@ -17128,7 +16956,28 @@ class XianyuLive:
                                             await self.send_msg(self.ws, chat_id, send_user_id, "抱歉，自动发货失败，请联系客服处理。")
                                     except Exception as e:
                                         logger.error(f"亦凡API发货异常: {self._safe_str(e)}")
-                                        await self.send_msg(self.ws, chat_id, send_user_id, "系统异常，请联系客服处理。")
+                                        if chat_delivered:
+                                            buyer_message = "发货消息已发送，但确认发货失败，请稍后刷新订单状态。"
+                                            error_message = f"私聊发货已确认送达，但确认发货失败: {self._safe_str(e)}"
+                                        else:
+                                            buyer_message = "系统异常，请联系客服处理。"
+                                            error_message = f"私聊发货未确认送达，未执行平台发货: {self._safe_str(e)}"
+                                        try:
+                                            await self.send_msg(self.ws, chat_id, send_user_id, buyer_message)
+                                        except Exception as apology_error:
+                                            logger.error(f"【{self.cookie_id}】亦凡发货失败后的道歉消息未送达: {self._safe_str(apology_error)}")
+                                        try:
+                                            await self.send_delivery_failure_notification(
+                                                send_user_name=send_user_name,
+                                                send_user_id=send_user_id,
+                                                item_id=item_id_saved,
+                                                error_message=error_message,
+                                                order_id=order_id_saved,
+                                            )
+                                        except Exception as notify_error:
+                                            logger.error(f"【{self.cookie_id}】亦凡发货失败通知发送异常: {self._safe_str(notify_error)}")
+                                    finally:
+                                        self._exit_fulfillment_priority()
                                     
                                     return  # 处理完毕
                                     
@@ -17764,31 +17613,10 @@ class XianyuLive:
                     # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
-                        logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
-                        
-                        try:
-                            # 调用统一的密码登录刷新方法
-                            refresh_success = await self._try_password_login_refresh(
-                                f"连续失败{self.max_connection_failures}次",
-                                ignore_slider_failed_backoff=self._has_recent_slider_success(),
-                            )
-                            
-                            if refresh_success:
-                                logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，将重置失败计数并继续重连")
-                                # 重置失败计数，因为已经刷新了Cookie
-                                self.connection_failures = 0
-                                # 更新连接状态
-                                self._set_connection_state(ConnectionState.RECONNECTING, "Cookie已刷新，准备重连")
-                                # 短暂等待后继续重连循环
-                                await asyncio.sleep(2)
-                                continue
-                            else:
-                                logger.warning(f"【{self.cookie_id}】❌ 密码登录刷新失败，将重启实例...")
-                        except Exception as refresh_e:
-                            logger.error(f"【{self.cookie_id}】密码登录刷新过程异常: {self._safe_str(refresh_e)}")
-                            logger.warning(f"【{self.cookie_id}】将重启实例...")
-                        
-                        # 如果密码登录刷新失败或异常，则重启实例
+                        logger.warning(
+                            f"【{self.cookie_id}】连续失败{self.max_connection_failures}次。"
+                            f"密码重登已关闭，请扫码登录，将重启实例"
+                        )
                         logger.error(f"【{self.cookie_id}】准备重启实例...")
                         self.connection_failures = 0  # 重置失败计数
                         
@@ -18306,11 +18134,12 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】图片内容JSON: {content_json}")
             logger.info(f"【{self.cookie_id}】Base64编码长度: {len(content_base64)}")
 
-            # 构造WebSocket消息（完全参考send_msg的格式）
+            # 构造WebSocket消息（完全参考send_msg的格式），发送后必须等到这条 mid 的成功回执。
+            mid = generate_mid()
             msg = {
                 "lwp": "/r/MessageSend/sendByReceiverScope",
                 "headers": {
-                    "mid": generate_mid()
+                    "mid": mid
                 },
                 "body": [
                     {
@@ -18344,8 +18173,20 @@ class XianyuLive:
                 ]
             }
 
-            await ws.send(json.dumps(msg))
-            logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
+            raw_message = json.dumps(msg)
+            if ws is self.ws:
+                response = await self._await_lwp_ack_on_shared_socket(ws, mid, raw_message)
+            else:
+                response = await self._await_lwp_ack_on_dedicated_socket(ws, mid, raw_message)
+            if not _send_ack_is_success(response):
+                code = None
+                if isinstance(response, dict):
+                    code = response.get("code")
+                    headers = response.get("headers")
+                    if code is None and isinstance(headers, dict):
+                        code = headers.get("code")
+                raise MessageSendAckTimeoutError(f"图片消息未收到成功回执 mid={mid} code={code}")
+            logger.info(f"【{self.cookie_id}】图片消息已确认送达: {image_url}")
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送图片消息失败: {self._safe_str(e)}")

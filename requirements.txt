@@ -16,7 +16,7 @@ aiohttp>=3.9.0
 aiohttp-socks>=0.8.0  # aiohttp代理支持（HTTP/HTTPS/SOCKS5）
 python-socks[asyncio]>=2.0.0  # WebSocket代理支持
 requests>=2.31.0
-httpx>=0.25.0
+httpx>=0.26
 
 # ==================== 配置文件处理 ====================
 PyYAML>=6.0.0

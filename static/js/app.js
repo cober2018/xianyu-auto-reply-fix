@@ -14330,51 +14330,12 @@ async function checkManualCookieImportStatus() {
 
 // 切换账号密码登录表单显示/隐藏
 function togglePasswordLogin() {
-    const passwordForm = document.getElementById('passwordLoginForm');
-    const manualForm = document.getElementById('manualInputForm');
-    const refreshForm = document.getElementById('refreshCookieForm');
-    if (passwordForm.style.display === 'none') {
-        // 隐藏手动输入表单
-        if (manualForm) {
-            manualForm.style.display = 'none';
-            resetManualCookieImportForm();
-        }
-        // 隐藏刷新Cookie表单
-        if (refreshForm) {
-            refreshForm.style.display = 'none';
-        }
-        passwordForm.style.display = 'block';
-        // 清空表单
-        document.getElementById('passwordLoginFormElement').reset();
-    } else {
-        passwordForm.style.display = 'none';
-    }
+    showToast('密码重登已关闭，请使用扫码登录', 'warning');
 }
 
 // 切换刷新Cookie表单显示/隐藏
 function toggleRefreshCookieForm() {
-    const refreshForm = document.getElementById('refreshCookieForm');
-    const manualForm = document.getElementById('manualInputForm');
-    const passwordForm = document.getElementById('passwordLoginForm');
-
-    if (refreshForm.style.display === 'none') {
-        // 隐藏其他表单
-        if (manualForm) {
-            manualForm.style.display = 'none';
-            resetManualCookieImportForm();
-        }
-        if (passwordForm) {
-            passwordForm.style.display = 'none';
-        }
-        refreshForm.style.display = 'block';
-        // 清空表单
-        document.getElementById('refreshCookieFormElement').reset();
-        document.getElementById('refreshCookieAccountStatus').innerHTML = '请先选择账号';
-        // 加载账号列表到下拉框
-        loadRefreshCookieAccountList();
-    } else {
-        refreshForm.style.display = 'none';
-    }
+    showToast('密码重登已关闭，请使用扫码登录', 'warning');
 }
 
 // 加载账号列表到刷新Cookie下拉框
@@ -14441,56 +14402,7 @@ document.addEventListener('DOMContentLoaded', function() {
 // 处理刷新Cookie表单提交
 async function handleRefreshCookie(event) {
     event.preventDefault();
-
-    const select = document.getElementById('refreshCookieAccountSelect');
-    const cookieId = select.value;
-    const selectedOption = select.options[select.selectedIndex];
-    const showBrowser = document.getElementById('refreshCookieShowBrowser').checked;
-
-    if (!cookieId) {
-        showToast('请选择要刷新的账号', 'warning');
-        return;
-    }
-
-    const hasCredentials = selectedOption.dataset.hasCredentials === 'true';
-    if (!hasCredentials) {
-        showToast('该账号未配置用户名和密码，无法刷新Cookie', 'danger');
-        return;
-    }
-
-    // 显示loading
-    toggleLoading(true);
-
-    try {
-        // 调用密码登录API刷新Cookie
-        const response = await fetch(`${apiBase}/password-login`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: JSON.stringify({
-                account_id: cookieId,
-                refresh_mode: true,  // 标记为刷新模式
-                show_browser: showBrowser
-            })
-        });
-
-        const data = await response.json();
-
-        if (data.session_id) {
-            // 开始轮询检查登录状态
-            showToast('正在验证账号并刷新Cookie，请稍候...', 'info');
-            startRefreshCookiePolling(data.session_id, cookieId);
-        } else {
-            toggleLoading(false);
-            showToast(data.message || '启动刷新失败', 'danger');
-        }
-    } catch (error) {
-        toggleLoading(false);
-        console.error('刷新Cookie失败:', error);
-        showToast('刷新Cookie失败: ' + error.message, 'danger');
-    }
+    showToast('密码重登已关闭，请使用扫码登录', 'warning');
 }
 
 // 更新刷新Cookie状态显示
@@ -14644,55 +14556,7 @@ let passwordLoginQRModalState = {
 // 处理账号密码登录表单提交
 async function handlePasswordLogin(event) {
     event.preventDefault();
-    
-    const accountId = document.getElementById('passwordLoginAccountId').value.trim();
-    const account = document.getElementById('passwordLoginAccount').value.trim();
-    const password = document.getElementById('passwordLoginPassword').value;
-    const showBrowser = document.getElementById('passwordLoginShowBrowser').checked;
-    
-    if (!accountId || !account || !password) {
-        showToast('请填写完整的登录信息', 'warning');
-        return;
-    }
-    
-    // 禁用提交按钮，显示加载状态
-    const submitBtn = event.target.querySelector('button[type="submit"]');
-    const originalText = submitBtn.innerHTML;
-    submitBtn.disabled = true;
-    submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>登录中...';
-    
-    try {
-        const response = await fetch(`${apiBase}/password-login`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${authToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                account_id: accountId,
-                account: account,
-                password: password,
-                show_browser: showBrowser
-            })
-        });
-        
-        const data = await response.json();
-        
-        if (response.ok && data.success && data.session_id) {
-            passwordLoginSessionId = data.session_id;
-            // 开始轮询检查登录状态
-            startPasswordLoginCheck();
-        } else {
-            showToast(data.message || '登录失败，请检查账号密码是否正确', 'danger');
-            submitBtn.disabled = false;
-            submitBtn.innerHTML = originalText;
-        }
-    } catch (error) {
-        console.error('账号密码登录失败:', error);
-        showToast('网络错误，请重试', 'danger');
-        submitBtn.disabled = false;
-        submitBtn.innerHTML = originalText;
-    }
+    showToast('密码重登已关闭，请使用扫码登录', 'warning');
 }
 
 // 开始检查账号密码登录状态
