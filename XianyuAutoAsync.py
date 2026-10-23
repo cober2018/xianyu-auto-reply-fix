@@ -316,6 +316,7 @@ class XianyuLive:
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
     _password_login_failure_backoff = {}  # {cookie_id: {'until': float, 'reason': str, 'seconds': int}}
+    _post_qr_patrol_due = {}  # {cookie_id: requested_at} 扫码热重载完成后待触发的待发货补发巡检
 
     # 手动刷新状态：用于避免手动刷新与自动滑块/自动Cookie刷新互相踩踏
     _manual_refresh_state = {}  # {cookie_id: {'source': str, 'phase': str, 'started_at': float, 'previous_cookie_refresh_enabled': Optional[bool]}}
@@ -747,6 +748,61 @@ class XianyuLive:
         cls._password_login_failure_backoff.pop(cookie_id, None)
 
     @classmethod
+    def clear_class_level_backoffs(cls, cookie_id: str):
+        """扫码成功（最高优先级人工授权）后，彻底清空该账号全部进程内退避与失败计数。
+
+        覆盖：密码登录失败退避表（含 hard_block/slider_failed/credentials 等）、
+        初始化鉴权失败熔断窗口，以及已注册实例上的刷新状态与失败计数。
+        """
+        if not cookie_id:
+            return
+        cls.clear_password_login_failure_backoff(cookie_id)
+        cls.clear_init_auth_failure_state(cookie_id)
+        instance = cls._instances.get(cookie_id)
+        if instance is not None:
+            try:
+                instance.clear_all_login_backoffs()
+            except Exception as e:
+                logger.warning(f"【{cookie_id}】清理实例级退避状态失败: {e}")
+
+    @classmethod
+    def request_post_qr_delivery_patrol(cls, cookie_id: str):
+        """登记扫码热重载完成后的待发货补发巡检请求，新连接就绪后消费。"""
+        if cookie_id:
+            cls._post_qr_patrol_due[cookie_id] = time.time()
+
+    @classmethod
+    def consume_post_qr_delivery_patrol_request(cls, cookie_id: str) -> bool:
+        """连接就绪后消费补发巡检请求；每次登记只触发一次。"""
+        if not cookie_id:
+            return False
+        return cls._post_qr_patrol_due.pop(cookie_id, None) is not None
+
+    def clear_all_login_backoffs(self):
+        """清空本实例全部登录退避、熔断与失败计数，并唤醒退避等待中的主循环立即重连。"""
+        XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+        XianyuLive.clear_init_auth_failure_state(self.cookie_id)
+        self.last_token_refresh_status = None
+        self.last_token_refresh_error_message = ""
+        self.last_password_login_backoff_log_time = 0.0
+        self.connection_failures = 0
+        self.init_auth_failures = 0
+        self.last_init_failure_type = None
+        self.last_init_failure_reason = None
+        self._pending_shipment_probe_at = 0.0
+        self._pending_shipment_probe_value = False
+        wake_event = getattr(self, '_login_backoff_wake_event', None)
+        if wake_event is None:
+            try:
+                wake_event = asyncio.Event()
+                self._login_backoff_wake_event = wake_event
+            except Exception:
+                wake_event = None
+        if wake_event is not None:
+            wake_event.set()
+        logger.warning(f"【{self.cookie_id}】人工扫码授权：已清空全部进程内登录退避与失败计数")
+
+    @classmethod
     def set_password_login_failure_backoff(cls, cookie_id: str, reason: str, seconds: int):
         """设置密码登录失败后的退避时间"""
         if not cookie_id or seconds <= 0:
@@ -904,6 +960,18 @@ class XianyuLive:
         state['reason'] = backoff_reason
         state['remaining_time'] = remaining_time
         return state
+
+    def _get_manual_qr_wait_seconds(self) -> int:
+        """登录退避（hard_block 等）等待人工扫码期间，主循环重连的低频静默间隔。
+
+        返回 0 表示不在退避中；否则返回 300~600 秒——期间只做只读检查，
+        不发起 WebSocket 连接，也不请求 Token 接口，避免加重 RGV587 惩罚。
+        """
+        backoff = self._get_active_password_login_failure_backoff()
+        if not backoff:
+            return 0
+        remaining = int(backoff.get('remaining_time', 0) or 0)
+        return min(max(remaining, 300), 600)
 
     def _should_skip_token_refresh_for_login_backoff(self, current_time: Optional[float] = None) -> bool:
         """在需要人工介入或明确退避期间，直接跳过 token 预检，避免重复打到平台。"""
@@ -2176,6 +2244,7 @@ class XianyuLive:
         )
         self.last_password_login_backoff_log_time = 0.0
         self.token_refresh_lock = asyncio.Lock()  # 防止多个入口并发刷新 token
+        self._login_backoff_wake_event = asyncio.Event()  # 扫码清除退避后唤醒退避等待中的主循环
 
         # WebSocket连接监控
         self.connection_state = ConnectionState.DISCONNECTED  # 连接状态
@@ -5096,6 +5165,66 @@ class XianyuLive:
             buyer_id=buyer_id,
             source=source,
         )
+
+    async def _run_post_qr_delivery_patrol(self, max_orders: int = 20) -> int:
+        """扫码热重载完成后的一次性高优先级巡检：用全新长连接补发积压的待发货订单。
+
+        只在连接就绪且有 Token 时执行；发货走现有原子链路（私聊 ACK 成功后才平台确认），
+        稳定期内不请求 Token 接口。
+        """
+        from db_manager import db_manager
+
+        wait_window = float(getattr(self, "_post_qr_patrol_max_wait_seconds", 120) or 120)
+        deadline = time.time() + wait_window
+        while time.time() < deadline:
+            if self.connection_state != ConnectionState.CONNECTED:
+                break
+            if self.current_token:
+                break
+            await asyncio.sleep(2)
+
+        if not self.current_token or self.connection_state != ConnectionState.CONNECTED:
+            logger.warning(f"【{self.cookie_id}】扫码补发巡检取消：新长连接未就绪（无Token或未连接）")
+            return 0
+
+        self._enter_fulfillment_priority()
+        fulfilled = 0
+        try:
+            try:
+                pending_orders = await asyncio.to_thread(
+                    db_manager.get_pending_ship_orders, self.cookie_id, max_orders
+                )
+            except Exception as e:
+                logger.error(f"【{self.cookie_id}】扫码补发巡检验索待发货订单失败: {self._safe_str(e)}")
+                return 0
+
+            if not pending_orders:
+                logger.info(f"【{self.cookie_id}】扫码补发巡检完成：没有积压的待发货订单")
+                return 0
+
+            logger.warning(
+                f"【{self.cookie_id}】扫码补发巡检发现 {len(pending_orders)} 个积压待发货订单，开始用新长连接补发"
+            )
+            for order in pending_orders:
+                try:
+                    if await self._auto_deliver_recovered_pending_order(
+                        order,
+                        source='post_qr_patrol',
+                    ):
+                        fulfilled += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as order_e:
+                    logger.error(
+                        f"【{self.cookie_id}】扫码补发巡检处理订单失败 "
+                        f"order_id={order.get('order_id')}: {self._safe_str(order_e)}"
+                    )
+            logger.warning(
+                f"【{self.cookie_id}】扫码补发巡检完成: 补发 {fulfilled}/{len(pending_orders)} 个订单"
+            )
+            return fulfilled
+        finally:
+            self._exit_fulfillment_priority()
 
     async def _recover_recent_missing_orders(self, max_orders: int = 10) -> int:
         from db_manager import db_manager
@@ -13736,12 +13865,16 @@ class XianyuLive:
 
                         current_time = time.time()
                         if current_time - last_order_recovery > 600:
-                            recovered_count = await self._recover_stale_unsettled_orders(
-                                older_than_minutes=10,
-                                limit=5
-                            )
-                            if recovered_count > 0:
-                                logger.warning(f"【{self.cookie_id}】超时未结算订单补偿处理完成，处理 {recovered_count} 个订单")
+                            if self._get_manual_qr_wait_seconds() > 0:
+                                # 风控退避等待人工扫码期间，暂停打平台详情接口，只做本地只读等待
+                                logger.info(f"【{self.cookie_id}】登录退避等待人工扫码中，暂停超时订单补偿刷新（低频静默）")
+                            else:
+                                recovered_count = await self._recover_stale_unsettled_orders(
+                                    older_than_minutes=10,
+                                    limit=5
+                                )
+                                if recovered_count > 0:
+                                    logger.warning(f"【{self.cookie_id}】超时未结算订单补偿处理完成，处理 {recovered_count} 个订单")
                             self.__class__._last_unsettled_order_recovery_time = current_time
                     except asyncio.CancelledError:
                         raise
@@ -13754,12 +13887,17 @@ class XianyuLive:
                         last_recent_order_recovery = getattr(self, '_last_recent_order_recovery_time', 0)
                         current_time = time.time()
                         if current_time - last_recent_order_recovery > 900:
-                            recent_recovered_count = await self._recover_recent_missing_orders(max_orders=10)
-                            if recent_recovered_count > 0:
-                                logger.warning(
-                                    f"【{self.cookie_id}】近期订单巡检补偿完成，处理 {recent_recovered_count} 个订单"
-                                )
-                            self._last_recent_order_recovery_time = current_time
+                            if self._get_manual_qr_wait_seconds() > 0:
+                                # 近期订单巡检会拉起无头浏览器拉取订单历史，退避期间必须静默
+                                logger.info(f"【{self.cookie_id}】登录退避等待人工扫码中，暂停近期订单巡检（低频静默）")
+                                self._last_recent_order_recovery_time = current_time
+                            else:
+                                recent_recovered_count = await self._recover_recent_missing_orders(max_orders=10)
+                                if recent_recovered_count > 0:
+                                    logger.warning(
+                                        f"【{self.cookie_id}】近期订单巡检补偿完成，处理 {recent_recovered_count} 个订单"
+                                    )
+                                self._last_recent_order_recovery_time = current_time
                     except asyncio.CancelledError:
                         raise
                     except Exception as recent_order_recovery_e:
@@ -17400,6 +17538,30 @@ class XianyuLive:
                         await self._interruptible_sleep(remaining_seconds)
                         continue
 
+                    # 风控退避（hard_block 等）等待人工扫码期间，严禁高频唤起新连接打 Token 接口，
+                    # 转为 5~10 分钟一次的低频静默等待；扫码清除退避会立即唤醒本循环。
+                    manual_qr_wait_seconds = self._get_manual_qr_wait_seconds()
+                    if manual_qr_wait_seconds > 0:
+                        self._set_connection_state(
+                            ConnectionState.RECONNECTING,
+                            f"登录退避中，等待人工扫码，{manual_qr_wait_seconds}秒后只读检查"
+                        )
+                        logger.warning(
+                            f"【{self.cookie_id}】登录退避中，低频静默等待 {manual_qr_wait_seconds} 秒，"
+                            f"期间不发起WebSocket连接、不请求Token接口（等待人工扫码）"
+                        )
+                        wake_event = getattr(self, '_login_backoff_wake_event', None)
+                        if wake_event is not None:
+                            wake_event.clear()
+                            try:
+                                await asyncio.wait_for(wake_event.wait(), timeout=manual_qr_wait_seconds)
+                                logger.warning(f"【{self.cookie_id}】退避等待被人工扫码清除，立即恢复连接")
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await self._interruptible_sleep(manual_qr_wait_seconds)
+                        continue
+
                     headers = self._build_websocket_headers()
 
                     # 更新连接状态为连接中
@@ -17421,6 +17583,11 @@ class XianyuLive:
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
                             self._reset_stream_activity_state(self.last_successful_connection)
+
+                            # 扫码热重载后的高优先级补发巡检：连接就绪立即用新长连接补发积压订单
+                            if self.consume_post_qr_delivery_patrol_request(self.cookie_id):
+                                logger.warning(f"【{self.cookie_id}】扫码热重载连接就绪，启动待发货补发巡检")
+                                self._create_tracked_task(self._run_post_qr_delivery_patrol())
 
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}, stream_watchdog={self.stream_watchdog_task}")

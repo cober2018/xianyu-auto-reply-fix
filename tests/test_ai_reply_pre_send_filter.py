@@ -28,10 +28,13 @@ class AIReplyPreSendFilterTest(unittest.IsolatedAsyncioTestCase):
         return live
 
     async def _process(self, live):
+        # 拟人化回复延迟（夜间最长480秒）与被测逻辑无关，归零避免用例挂起
+        live._is_in_night_mode_window = lambda: False
         with (
             patch("XianyuAutoAsync.AUTO_REPLY", {"enabled": True}),
             patch("db_manager.db_manager.save_chat_message", return_value=101),
             patch("chat_event_hub.publish_chat_message"),
+            patch("XianyuAutoAsync.random.uniform", return_value=0.0),
         ):
             await live._process_chat_message_reply(
                 message_data={"headers": {}, "body": {}},

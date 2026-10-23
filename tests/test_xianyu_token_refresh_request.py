@@ -221,6 +221,8 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         live.connection_state = ConnectionState.DISCONNECTED
         live.ws = None
         live._safe_str = lambda exc: str(exc)
+        # 自动滑块恢复现默认关闭；这两个用例验证的是"启用时"的场景标记与持久档案行为
+        live._is_auto_captcha_recovery_enabled = lambda: True
 
         async def fake_send_notification(*_args, **_kwargs):
             return None
@@ -260,6 +262,8 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         live.connection_state = ConnectionState.DISCONNECTED
         live.ws = None
         live._safe_str = lambda exc: str(exc)
+        # 自动滑块恢复现默认关闭；本用例验证"启用时"账号持久档案参数仍会传入
+        live._is_auto_captcha_recovery_enabled = lambda: True
 
         async def fake_send_notification(*_args, **_kwargs):
             return None

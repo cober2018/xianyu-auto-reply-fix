@@ -7444,6 +7444,41 @@ Cookie数量: {cookie_count}
                 logger.error(f"查询待发货订单失败: cookie_id={cookie_id} - {e}")
                 return False
 
+    def get_pending_ship_orders(self, cookie_id: str, limit: int = 20) -> list:
+        """获取账号积压的待发货订单（扫码热重载后补发巡检用）。只读，不做买家昵称回填。"""
+        if not cookie_id:
+            return []
+        safe_limit = max(1, min(int(limit or 20), 100))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT order_id, item_id, buyer_id, buyer_nick, sid, order_status, updated_at
+                    FROM orders
+                    WHERE cookie_id = ?
+                      AND order_status IN ('pending_ship', 'pending_delivery')
+                    ORDER BY datetime(created_at) ASC
+                    LIMIT ?
+                    ''',
+                    (cookie_id, safe_limit)
+                )
+                return [
+                    {
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': row[3],
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'updated_at': row[6],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"查询待发货订单列表失败: cookie_id={cookie_id} - {e}")
+                return []
+
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
         """根据Cookie ID获取订单列表"""
         with self.lock:
