@@ -7445,7 +7445,12 @@ Cookie数量: {cookie_count}
                 return False
 
     def get_pending_ship_orders(self, cookie_id: str, limit: int = 20) -> list:
-        """获取账号积压的待发货订单（扫码热重载后补发巡检用）。只读，不做买家昵称回填。"""
+        """获取账号积压的待发货/部分发货订单（扫码热重载后补发巡检用）。
+
+        只读，不做买家昵称回填。包含四类状态，由调用方按状态差异化补偿：
+        pending_ship/pending_delivery 全量补发；partial_success 只补未完成单元；
+        partial_pending_finalize 只补平台确认、绝不重发私信。
+        """
         if not cookie_id:
             return []
         safe_limit = max(1, min(int(limit or 20), 100))
@@ -7457,7 +7462,12 @@ Cookie数量: {cookie_count}
                     SELECT order_id, item_id, buyer_id, buyer_nick, sid, order_status, updated_at
                     FROM orders
                     WHERE cookie_id = ?
-                      AND order_status IN ('pending_ship', 'pending_delivery')
+                      AND order_status IN (
+                          'pending_ship',
+                          'pending_delivery',
+                          'partial_success',
+                          'partial_pending_finalize'
+                      )
                     ORDER BY datetime(created_at) ASC
                     LIMIT ?
                     ''',

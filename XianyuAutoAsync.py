@@ -981,7 +981,7 @@ class XianyuLive:
             return False
 
         backoff_reason = failure_backoff.get('reason', 'unknown')
-        if backoff_reason not in {'slider_failed', 'verification_required', 'credentials', 'risk_control', 'browser_crash'}:
+        if backoff_reason not in {'slider_failed', 'verification_required', 'credentials', 'risk_control', 'browser_crash', 'hard_block'}:
             return False
 
         remaining_time = failure_backoff.get('remaining_time', 0.0)
@@ -5166,6 +5166,218 @@ class XianyuLive:
             source=source,
         )
 
+    async def _compensate_partial_order(self, order: Dict[str, Any], source: str = 'post_qr_patrol') -> bool:
+        """Partial（部分发货/部分待收尾）订单的强幂等补偿。铁律：
+
+        1. 已 finalized 的单元：绝不重发、绝不再确认；
+        2. 已 sent（私信已确认送达）的单元：绝不重发私信，只补收尾/补平台确认；
+        3. 只有 remaining（从未发送）的单元才允许发送，发送前还要按单元级状态硬闸门二次校验；
+        4. 平台确认（dummy）作用于整单——只要还有单元未确认送达，就绝不触发确认。
+        """
+        from db_manager import db_manager
+
+        fallback_order = order or {}
+        order_id = str(fallback_order.get('order_id') or '').strip()
+        item_id = str(fallback_order.get('item_id') or '').strip()
+        buyer_id = str(fallback_order.get('buyer_id') or '').strip()
+        if not order_id or not item_id or not buyer_id:
+            logger.warning(f"【{self.cookie_id}】{source} Partial订单缺少订单/商品/买家信息，跳过补偿: {order_id}")
+            return False
+
+        quantity = self._get_order_expected_delivery_quantity(order_id)
+        summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
+        finalized_units = set(summary.get('finalized_unit_indexes') or [])
+        pending_finalize_units = list(summary.get('pending_finalize_unit_indexes') or [])
+        remaining_units = [u for u in (summary.get('remaining_unit_indexes') or []) if u not in finalized_units]
+        logger.warning(
+            f"【{self.cookie_id}】{source} Partial补偿开始: order_id={order_id}, 应发={quantity}, "
+            f"已完成={sorted(finalized_units)}, 待收尾={pending_finalize_units}, 待补发={remaining_units}"
+        )
+
+        websocket = getattr(self, 'ws', None)
+        sid = str(fallback_order.get('sid') or '')
+        chat_id = sid.replace('@goofish', '') if sid else ''
+        buyer_nick = fallback_order.get('buyer_nick') or ''
+        item_title = "待获取商品信息"
+        user_url = f'https://www.goofish.com/personal?userId={buyer_id}' if buyer_id else None
+        delivered_units_meta = {}
+        any_send_failed = False
+
+        # ── 步骤1：只补发 remaining 单元（双重硬闸门：summary 之后再按单元实读状态校验）──
+        for unit_index in remaining_units:
+            unit_state = db_manager.get_delivery_finalization_state(order_id, unit_index) or {}
+            unit_status = str(unit_state.get('status') or '').strip()
+            if unit_status in {'sent', 'finalized'}:
+                logger.warning(
+                    f"【{self.cookie_id}】{source} Partial补偿硬闸门: 单元 {unit_index} 实读状态为 {unit_status}，绝不重发: {order_id}"
+                )
+                continue
+
+            rule_meta = {}
+            delivery_result = None
+            try:
+                delivery_result = await self._auto_delivery(
+                    item_id,
+                    item_title,
+                    order_id,
+                    buyer_id,
+                    chat_id,
+                    buyer_nick,
+                    include_meta=True,
+                    delivery_unit_index=unit_index
+                )
+            except Exception as prep_error:
+                last_error = f"{source} 准备第 {unit_index} 个卡券失败: {self._safe_str(prep_error)}"
+                logger.error(f"【{self.cookie_id}】{last_error}: {order_id}")
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='failed', reason=last_error, channel=source,
+                )
+                any_send_failed = True
+                continue
+
+            if isinstance(delivery_result, dict):
+                delivery_content = delivery_result.get('content')
+                delivery_steps = delivery_result.get('delivery_steps') or []
+                rule_meta = delivery_result
+            else:
+                delivery_content = delivery_result
+                delivery_steps = []
+
+            if not delivery_content:
+                failure_reason = (
+                    (delivery_result.get('error') if isinstance(delivery_result, dict) else None)
+                    or f"{source} 第 {unit_index} 个卡券内容获取失败"
+                )
+                self._release_data_reservation_if_needed(rule_meta, error=failure_reason)
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='failed', reason=failure_reason, channel=source, rule_meta=rule_meta,
+                )
+                logger.error(f"【{self.cookie_id}】{source} {failure_reason}: {order_id}")
+                any_send_failed = True
+                continue
+
+            if not delivery_steps:
+                delivery_steps = self._build_delivery_steps(
+                    delivery_content, rule_meta.get('card_description', '')
+                )
+
+            try:
+                if not websocket or not chat_id:
+                    raise RuntimeError('长连接或会话ID不可用，无法私聊补发')
+                await self._send_delivery_steps(
+                    websocket, chat_id, buyer_id, delivery_steps,
+                    user_url=user_url,
+                    log_prefix=f"{source} Partial补发单元{unit_index}/{quantity}",
+                )
+            except Exception as send_error:
+                send_error_text = self._safe_str(send_error)
+                self._release_data_reservation_if_needed(rule_meta, error=f'发送失败(unit={unit_index}): {send_error_text}')
+                failure_reason = f"私聊发货未确认送达，未执行平台发货: {send_error_text}"
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='failed', reason=failure_reason, channel=source, rule_meta=rule_meta,
+                )
+                logger.error(f"【{self.cookie_id}】{source} 单元 {unit_index} {failure_reason}: {order_id}")
+                any_send_failed = True
+                continue
+
+            # 私聊已 ACK 送达：标记 sent（未确认整单送达前不触发平台确认）
+            if not self._mark_data_reservation_sent_if_needed(rule_meta):
+                logger.error(f"【{self.cookie_id}】{source} 单元 {unit_index} 已送达但标记预占失败，卡密不释放: {order_id}")
+            self._persist_delivery_finalization_state(
+                order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                delivery_meta=rule_meta, channel=source, status='sent',
+            )
+            self._record_delivery_log(
+                order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                status='success', reason=f'{source} Partial补发单元 {unit_index} 私聊送达成功（待整单确认后收尾）',
+                channel=source, rule_meta=rule_meta,
+            )
+            delivered_units_meta[unit_index] = rule_meta
+
+        # ── 步骤2：只要还有单元未确认送达，绝不触发整单平台确认 ──
+        if any_send_failed:
+            for unit_index, unit_meta in delivered_units_meta.items():
+                self._persist_delivery_finalization_state(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                    delivery_meta=unit_meta, channel=source, status='sent',
+                    last_error="同订单另有卡券未送达，本次不执行平台确认",
+                )
+            self._sync_order_delivery_progress(
+                order_id=order_id, cookie_id=self.cookie_id,
+                expected_quantity=quantity, context=f"{source} Partial补偿部分单元未送达",
+            )
+            logger.error(
+                f"【{self.cookie_id}】{source} Partial补偿: 存在未送达单元，本次补发的 "
+                f"{len(delivered_units_meta)} 个单元保持待收尾，未执行平台确认: {order_id}"
+            )
+            return False
+
+        # ── 步骤3：全部单元已送达（finalized + sent 覆盖 1..N），开始统一收尾 ──
+        # 3a. 平台确认失败过的单元（pending_platform_confirm）交给专用重试：只补确认，绝不重发
+        try:
+            confirm_retry_result = await self.retry_pending_platform_confirms(
+                order_id=order_id, source=source,
+            )
+            logger.info(f"【{self.cookie_id}】{source} Partial补确认结果: {order_id}, {confirm_retry_result.get('message')}")
+        except Exception as confirm_retry_error:
+            logger.error(
+                f"【{self.cookie_id}】{source} Partial补确认异常: {order_id}, {self._safe_str(confirm_retry_error)}"
+            )
+
+        # 3b. 其余 sent 状态单元逐一收尾（消费卡密 + 平台确认，confirmed_orders 冷却去重）
+        for unit_index in sorted(set(pending_finalize_units) | set(delivered_units_meta.keys())):
+            if unit_index in finalized_units:
+                continue
+            pending_meta = self._get_pending_delivery_finalization_meta(order_id, unit_index)
+            if not pending_meta:
+                continue
+            if pending_meta.get('pending_platform_confirm') or pending_meta.get('confirm_retry_required'):
+                continue  # 3a 已处理
+
+            finalize_result = await self._finalize_delivery_after_send(
+                delivery_meta=pending_meta, order_id=order_id, item_id=item_id,
+            )
+            if finalize_result.get('success'):
+                self._persist_delivery_finalization_state(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                    delivery_meta=pending_meta, channel=source, status='finalized',
+                )
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='success', reason=f'{source} Partial补偿收尾成功（单元 {unit_index}）',
+                    channel=source, rule_meta=pending_meta,
+                )
+            else:
+                finalize_error = finalize_result.get('error') or f'单元 {unit_index} 收尾失败'
+                if self._is_platform_confirm_failure_error(finalize_error):
+                    self._mark_delivery_pending_platform_confirm(
+                        order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                        delivery_meta=pending_meta, confirm_error=finalize_error,
+                        expected_quantity=quantity, context=f"{source} Partial补偿收尾平台确认失败",
+                    )
+                else:
+                    self._persist_delivery_finalization_state(
+                        order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                        delivery_meta=pending_meta, channel=source, status='sent',
+                        last_error=finalize_error,
+                    )
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='failed', reason=finalize_error, channel=source, rule_meta=pending_meta,
+                )
+                logger.error(f"【{self.cookie_id}】{source} {finalize_error}: {order_id}")
+
+        # ── 步骤4：汇总推进订单状态（全部 finalized 时推进为 shipped）──
+        self._sync_order_delivery_progress(
+            order_id=order_id, cookie_id=self.cookie_id,
+            expected_quantity=quantity, context=f"{source} Partial补偿完成",
+        )
+        logger.warning(f"【{self.cookie_id}】{source} Partial补偿完成: {order_id}")
+        return True
+
     async def _run_post_qr_delivery_patrol(self, max_orders: int = 20) -> int:
         """扫码热重载完成后的一次性高优先级巡检：用全新长连接补发积压的待发货订单。
 
@@ -5184,7 +5396,8 @@ class XianyuLive:
             await asyncio.sleep(2)
 
         if not self.current_token or self.connection_state != ConnectionState.CONNECTED:
-            logger.warning(f"【{self.cookie_id}】扫码补发巡检取消：新长连接未就绪（无Token或未连接）")
+            logger.warning(f"【{self.cookie_id}】扫码补发巡检取消：新长连接未就绪（无Token或未连接），放回登记下次连接就绪再触发")
+            XianyuLive.request_post_qr_delivery_patrol(self.cookie_id)
             return 0
 
         self._enter_fulfillment_priority()
@@ -5206,18 +5419,39 @@ class XianyuLive:
                 f"【{self.cookie_id}】扫码补发巡检发现 {len(pending_orders)} 个积压待发货订单，开始用新长连接补发"
             )
             for order in pending_orders:
+                order_id = order.get('order_id')
                 try:
-                    if await self._auto_deliver_recovered_pending_order(
-                        order,
-                        source='post_qr_patrol',
-                    ):
-                        fulfilled += 1
+                    # 一律按单元级进度决策，不信任订单级 partial 状态（聚合状态无法区分
+                    # "全部送达只差确认"与"还有单元从未发送"的混合情况）
+                    order_quantity = self._get_order_expected_delivery_quantity(order_id)
+                    order_summary = self._summarize_delivery_progress(
+                        order_id, expected_quantity=order_quantity
+                    ) or {}
+                    remaining_units = order_summary.get('remaining_unit_indexes') or []
+                    has_chat_context = bool(getattr(self, 'ws', None)) and bool(str(order.get('sid') or '').strip())
+
+                    if remaining_units and has_chat_context:
+                        # 存在从未发送的单元且可私聊：差异化强幂等补发
+                        # （新多数量订单与 partial_success 统一走这里：先发完所有单元，全部 ACK 后才整单确认）
+                        if await self._compensate_partial_order(order, source='post_qr_patrol'):
+                            fulfilled += 1
+                    elif remaining_units:
+                        # 缺会话信息无法私聊：退回旧恢复路径（含 without_sid 兜底）
+                        if await self._auto_deliver_recovered_pending_order(
+                            order,
+                            source='post_qr_patrol',
+                        ):
+                            fulfilled += 1
+                    else:
+                        # 全部单元已送达（含 partial_pending_finalize）：只补收尾/补平台确认，绝不重发
+                        if await self._compensate_partial_order(order, source='post_qr_patrol'):
+                            fulfilled += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception as order_e:
                     logger.error(
                         f"【{self.cookie_id}】扫码补发巡检处理订单失败 "
-                        f"order_id={order.get('order_id')}: {self._safe_str(order_e)}"
+                        f"order_id={order_id}: {self._safe_str(order_e)}"
                     )
             logger.warning(
                 f"【{self.cookie_id}】扫码补发巡检完成: 补发 {fulfilled}/{len(pending_orders)} 个订单"

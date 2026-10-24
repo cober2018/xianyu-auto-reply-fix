@@ -64,10 +64,24 @@ XianyuLive.clear_class_level_backoffs(cookie_id)
 
 核心效益：Uvicorn 与 reply_server.py 常驻不中断，SESSION_TOKENS 完好无损，前端和调用方零感知，不产生 401 未授权访问。
 
-### 4. 履约发货等待与优雅补偿
+### 4. 履约发货等待与 Partial（部分发货）优雅补偿规范
 
-- 待发货订单（pending_ship）在长连接处于风控熔断（hard_block 或 code=400）期间，看门狗程序应自动识别账号当前为“等待人工扫码中”，进入低频静默等待（每 5~10 分钟仅做只读检查，严禁高频唤起新连接打 Token 接口），防止产生新的 RGV587 挤爆拦截；
-- 一旦扫码热重载完成（connection_state == 'connected' 且 has_current_token == True），系统触发一次高优先级的 recent_order_watchdog 巡检，使用全新长连接自动将积压的订单发货并点确认发货。
+- **待发货与部分发货订单处理**：
+  1. **普通待发货订单（pending_ship）**：长连接风控熔断期间静默等待；扫码热重载后，看门狗自动触发全量发货并点确认发货。
+  2. **Partial 订单差异化补偿（强幂等性防重复发送）**：
+     - 针对 **partial_pending_finalize（待补确认）**：
+       * 语义：卡券私信已通过 WebSocket 确认送达买家，仅平台确认发货接口（dummy）未成功；
+       * 处置：**严禁重新向买家私信发送卡券**（避免刷屏和消耗多份卡密）！直接调用 `retry_pending_platform_confirms` 补调平台确认发货接口，收尾推进至 `shipped`。
+     - 针对 **partial_success（部分发货）**：
+       * 语义：多件商品中仅部分单元完成履约，仍有单元（remaining_unit_indexes）未发；
+       * 处置：调用 `_summarize_delivery_progress` 获取精准未完成单元索引，严格“只补发未完成的那几件”，已完成单元保持跳过，全部单元确认 ACK 送达后再收尾完成整个订单。
+
+**Partial 补发实现铁律（开发 Agent 必须遵守）**：
+
+1. 已 `finalized` 的单元：绝不重发、绝不再确认；
+2. 已 `sent`（私信已 ACK 送达）的单元：绝不重发私信，只补收尾/补平台确认；
+3. 只有 `remaining`（从未发送）的单元允许发送，且发送前必须按 `get_delivery_finalization_state` 单元级实读状态做硬闸门二次校验（summary 可能过期）；
+4. 平台确认（dummy consign）作用于**整单**——只要还有任何单元未确认送达，就绝不触发平台确认。补发顺序：先把全部未送达单元发送完毕，全部 ACK 后才统一收尾。
 
 ## 四、验证验收标准 (Test & Acceptance Criteria)
 

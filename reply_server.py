@@ -6350,13 +6350,33 @@ async def check_qr_code_status_lite(session_id: str, current_user: Dict[str, Any
         return {'status': 'error', 'message': str(e)}
 
 
+_AUTO_PAUSE_STATUS_NOTE_EXACT = {'连续风控保护中', '风控保护中'}
+
+
+def _is_auto_pause_status_note(note: str) -> bool:
+    """判断 status_note 是否为系统自动暂停账号时写入的文案。
+
+    只有点击手动停用（无文案）或系统自动暂停（有下列文案）两种情况会让账号停用；
+    只有后者允许被扫码成功自动恢复，避免运营者手动停用的账号被悄悄拉起。
+    """
+    text = str(note or '').strip()
+    if not text:
+        return False
+    if text in _AUTO_PAUSE_STATUS_NOTE_EXACT:
+        return True
+    if text.endswith('保护中') and ('风控' in text or '连续' in text):
+        return True
+    # 待人脸验证 / 待短信验证 / 待二维码验证 / 待扫码登录 / 待身份验证
+    return text.startswith('待') and (text.endswith('验证') or text.endswith('登录'))
+
+
 def _clear_login_backoffs_for_qr_success(account_id: str, current_user: Dict[str, Any] = None) -> None:
     """扫码成功（最高优先级人工授权）：原子清空该账号全部进程内退避与失败计数。
 
     覆盖 _password_login_failure_backoff（含 hard_block/slider_failed）、初始化鉴权熔断、
     实例级 last_token_refresh_status / connection_failures / init_auth_failures，
-    并唤醒正在退避等待中的主循环，使其立即用新凭证重连；同时清空 status_note，
-    并恢复因风控保护被自动停用的账号（扫码即人工授权上线）。
+    并唤醒正在退避等待中的主循环，使其立即用新凭证重连。
+    只恢复"因风控/人工验证被系统自动暂停"的账号；运营者手动停用的账号保持停用。
     """
     from XianyuAutoAsync import XianyuLive
 
@@ -6372,21 +6392,79 @@ def _clear_login_backoffs_for_qr_success(account_id: str, current_user: Dict[str
     except Exception as e:
         logger.warning(f"清理类级登录退避失败（不影响扫码流程）: {account_id}, {e}")
 
+    # 先读 status_note 判断停用原因，再决定是否恢复——手动停用的账号绝不能被扫码悄悄拉起
+    status_note = ''
     try:
-        db_manager.update_cookie_status_note(account_id, '')
+        details = db_manager.get_cookie_details(account_id) or {}
+        status_note = str(details.get('status_note') or '').strip()
     except Exception as e:
-        logger.warning(f"清理账号状态文案失败（不影响扫码流程）: {account_id}, {e}")
+        logger.warning(f"读取账号状态文案失败（不影响扫码流程）: {account_id}, {e}")
 
-    try:
-        if not db_manager.get_cookie_status(account_id):
-            db_manager.save_cookie_status(account_id, True)
-            if cookie_manager.manager:
-                cookie_manager.manager.cookie_status[account_id] = True
-            log_with_user('warning', f"账号此前被风控保护停用，扫码成功后已自动恢复启用: {account_id}", current_user)
-    except Exception as e:
-        logger.warning(f"恢复账号启用状态失败（不影响扫码流程）: {account_id}, {e}")
+    if _is_auto_pause_status_note(status_note):
+        try:
+            if not db_manager.get_cookie_status(account_id):
+                db_manager.save_cookie_status(account_id, True)
+                if cookie_manager.manager:
+                    cookie_manager.manager.cookie_status[account_id] = True
+                log_with_user('warning', f"账号此前被系统自动暂停（{status_note}），扫码成功后已恢复启用: {account_id}", current_user)
+        except Exception as e:
+            logger.warning(f"恢复账号启用状态失败（不影响扫码流程）: {account_id}, {e}")
+        try:
+            db_manager.update_cookie_status_note(account_id, '')
+        except Exception as e:
+            logger.warning(f"清理账号状态文案失败（不影响扫码流程）: {account_id}, {e}")
+    elif status_note:
+        logger.info(f"账号状态文案非自动暂停类型，扫码成功后保留不动: {account_id}, note={status_note}")
 
     log_with_user('info', f"扫码成功，已清空账号全部进程内退避与失败计数: {account_id}", current_user)
+
+
+async def _hot_reload_after_qr_success(
+    account_id: str,
+    cookie_value: str,
+    *,
+    is_new_account: bool,
+    current_user: Dict[str, Any],
+    user_id: int = None,
+) -> bool:
+    """扫码成功后的统一热重载：先清退避 → 进程内切换实例 → 切换完成后再清一次退避 → 登记补发巡检。
+
+    二次清退避是为了消灭交接竞态：update_cookie/add_cookie 内部 cancel 并 await 旧任务时会
+    让出事件循环，旧实例在途的失败响应可能在清锁之后又写入新的退避，新实例会直接继承，
+    表现为"扫了码还是不通"。整个过程不重启进程，SESSION_TOKENS 不受影响。
+    """
+    from XianyuAutoAsync import XianyuLive
+
+    manager = cookie_manager.manager
+    if not manager:
+        log_with_user('warning', f"真实Cookie已获取，但任务管理器未初始化，未启动账号任务: {account_id}", current_user)
+        return False
+
+    _clear_login_backoffs_for_qr_success(account_id, current_user)
+
+    switch_handle = None
+    try:
+        if is_new_account:
+            switch_handle = manager.add_cookie(account_id, cookie_value, user_id=user_id)
+            log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
+        else:
+            switch_handle = manager.update_cookie(account_id, cookie_value, save_to_db=False)
+            log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+    except Exception as switch_e:
+        log_with_user('warning', f"扫码后切换账号任务失败: {account_id}, {switch_e}", current_user)
+        return False
+
+    # 等待切换真正完成（旧任务取消并退场、新任务已启动），再做第二次清锁
+    if isinstance(switch_handle, (asyncio.Task, asyncio.Future)) or asyncio.iscoroutine(switch_handle):
+        try:
+            await switch_handle
+        except Exception as await_e:
+            log_with_user('warning', f"等待扫码后账号任务切换完成时出错: {account_id}, {await_e}", current_user)
+
+    XianyuLive.clear_class_level_backoffs(account_id)
+    XianyuLive.request_post_qr_delivery_patrol(account_id)
+    log_with_user('info', f"扫码热重载完成：已二次清退避并登记待发货补发巡检: {account_id}", current_user)
+    return True
 
 
 async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
@@ -6489,25 +6567,20 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 
                     try:
                         if cookie_manager.manager:
-                            # 扫码成功=最高优先级人工授权。必须先清空进程内全部退避/失败计数再热重载任务，
-                            # 否则新实例 init() 会读到旧的 hard_block/slider_failed 退避而拒绝上线，
-                            # 表现为"扫了码还是不通，非得重启整个服务"。
-                            _clear_login_backoffs_for_qr_success(account_id, current_user)
-                            if is_new_account:
-                                cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
-                                log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
-                            else:
-                                # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                                cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
-                                log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
-                            task_restarted = True
-                            db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
-                            XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
-                            # 热重载完成后触发一次高优先级补发巡检：新长连接就绪即补发积压的待发货订单
-                            XianyuLive.request_post_qr_delivery_patrol(account_id)
-                            log_with_user('info', f"扫码成功后已清除全部登录退避并登记补发巡检: {account_id}", current_user)
-                            warning_message = f"真实Cookie已获取，账号任务已切换；为降低再次触发风控的概率，将进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token"
-                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                            # 扫码成功=最高优先级人工授权。统一走热重载：
+                            # 先清全部退避 → 进程内切换实例 → 切换完成后二次清退避 → 登记补发巡检。
+                            task_restarted = await _hot_reload_after_qr_success(
+                                account_id,
+                                final_cookies,
+                                is_new_account=is_new_account,
+                                current_user=current_user,
+                                user_id=user_id,
+                            )
+                            if task_restarted:
+                                db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
+                                XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
+                                warning_message = f"真实Cookie已获取，账号任务已切换；为降低再次触发风控的概率，将进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token"
+                                log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
@@ -6657,19 +6730,14 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
             db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
             log_with_user('info', f"降级处理 - 现有账号原始cookie已更新: {account_id}", current_user)
 
-        # 添加到或更新cookie_manager
+        # 添加到或更新cookie_manager：降级保存同样走统一热重载（清退避→切换→二次清退避→登记补发巡检）
         if cookie_manager.manager:
-            from XianyuAutoAsync import XianyuLive
-            # 降级保存同样代表扫码成功的人工授权：先清退避再热重载，并登记补发巡检
-            _clear_login_backoffs_for_qr_success(account_id, current_user)
-            if is_new_account:
-                cookie_manager.manager.add_cookie(account_id, cookies)
-                log_with_user('info', f"降级处理 - 已将原始cookie添加到cookie_manager: {account_id}", current_user)
-            else:
-                # update_cookie_account_info 已经保存到数据库了，这里不需要再保存
-                cookie_manager.manager.update_cookie(account_id, cookies, save_to_db=False)
-                log_with_user('info', f"降级处理 - 已更新cookie_manager中的原始cookie: {account_id}", current_user)
-            XianyuLive.request_post_qr_delivery_patrol(account_id)
+            await _hot_reload_after_qr_success(
+                account_id,
+                cookies,
+                is_new_account=is_new_account,
+                current_user=current_user,
+            )
 
         return {
             'account_id': account_id,
@@ -6757,17 +6825,17 @@ async def refresh_cookies_from_qr_login(
                 except Exception:
                     pass
 
-            # 如果cookie_manager存在，更新其中的cookie
+            # 如果cookie_manager存在：手动扫码刷新同样走统一热重载（清退避→切换→二次清退避→登记补发巡检）
             if cookie_manager.manager:
-                # 手动扫码刷新同样是人工授权：先清退避再热重载，并登记补发巡检
-                _clear_login_backoffs_for_qr_success(cookie_id, current_user)
-                # 从数据库获取更新后的cookie
                 updated_cookie_info = db_manager.get_cookie_by_id(cookie_id)
                 if updated_cookie_info:
                     # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                    cookie_manager.manager.update_cookie(cookie_id, updated_cookie_info['cookies_str'], save_to_db=False)
-                    XianyuLive.request_post_qr_delivery_patrol(cookie_id)
-                    log_with_user('info', f"已更新cookie_manager中的cookie并登记补发巡检: {cookie_id}", current_user)
+                    await _hot_reload_after_qr_success(
+                        cookie_id,
+                        updated_cookie_info['cookies_str'],
+                        is_new_account=False,
+                        current_user=current_user,
+                    )
 
             return {
                 'success': True,
