@@ -256,11 +256,15 @@ class SecureConfirm:
                                 "confirm_retry_required": True,
                             }
 
-                        if 'ORDER_STATUS_ERROR' in error_msg or '订单状态不正确' in error_msg:
+                        # ORDER_ALREADY_DELIVERY（P0灰度实测）：平台已发货，不允许再次consign。
+                        # 与 ORDER_STATUS_ERROR 同为终态：绝不重试，交给上层按"缺口升级人工"处理
+                        if 'ORDER_STATUS_ERROR' in error_msg or '订单状态不正确' in error_msg \
+                                or 'ORDER_ALREADY_DELIVERY' in error_msg or '已发货成功' in error_msg:
                             return {
                                 "error": error_msg,
                                 "order_id": order_id,
                                 "order_status_error": True,
+                                "order_already_delivered": 'ORDER_ALREADY_DELIVERY' in error_msg or '已发货成功' in error_msg,
                                 "non_retryable": True,
                                 "stop_confirm_retry": True,
                                 "confirm_retry_required": False,

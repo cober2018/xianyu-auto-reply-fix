@@ -74,8 +74,11 @@ async def main() -> int:
         print("[P0] ✅ 情形通过：平台接受带 tradeText 的发货请求（G1/G2 主路径可行）")
         return 0
     error_text = str(result.get('error') or '')
-    if 'ORDER_STATUS_ERROR' in error_text:
-        print("[P0] ⚠️ 情形2结论：已发货订单不允许补写凭证（G5 自动补发降级为『仅告警』，"
+    if 'ORDER_ALREADY_DELIVERY' in error_text or result.get('order_already_delivered'):
+        print("[P0] ✅ 情形2结论（实测预期）：平台已发货不允许重复consign，接口本身通（G5 自动补写"
+              "对已发货订单不可行属预期，缺口巡检会升级人工告警；该错误已被识别为终态，不会重试）")
+    elif 'ORDER_STATUS_ERROR' in error_text or result.get('order_status_error'):
+        print("[P0] ⚠️ 情形2结论：订单状态不允许发货（G5 自动补发降级为『仅告警』，"
               "把 global_config.yml 的 RISK_CONTROL.delivery_gap_auto_retry 置 false 即可）")
     elif 'SESSION_EXPIRED' in error_text or result.get('session_expired'):
         print("[P0] ⚠️ Session 过期：请先扫码登录刷新 Cookie 再测")

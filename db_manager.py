@@ -5574,6 +5574,30 @@ Cookie数量: {cookie_count}
             'states': states,
         }
 
+    def has_manual_delivery_success(self, order_id: str) -> bool:
+        """该订单是否存在「手动发货成功」记录（运营方在控制台人工补发过的证据）。
+
+        履约缺口巡检用：命中即视为人工已补发，直接结案不再反复告警。
+        注意：只能识别经本系统手动发货入口的补发；直接在闲鱼App里人工发消息无日志可查。
+        """
+        if not order_id:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT 1 FROM delivery_logs
+                    WHERE order_id = ? AND channel = 'manual' AND status = 'success'
+                    LIMIT 1
+                    ''',
+                    (order_id,)
+                )
+                return cursor.fetchone() is not None
+            except Exception as e:
+                logger.error(f"查询手动发货成功记录失败: order_id={order_id} - {e}")
+                return False
+
     def get_recent_delivery_logs(self, user_id: int, limit: int = 20):
         """获取最近发货日志（按用户隔离）。"""
         with self.lock:

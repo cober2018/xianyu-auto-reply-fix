@@ -150,6 +150,30 @@ class SecureConfirmTradeTextTests(unittest.TestCase):
         self.assertLessEqual(len(json.loads(requests[0]['data']['data'])['tradeText']), 50)
 
 
+    def test_order_already_delivery_is_terminal_no_retry(self):
+        """P0灰度实测错误码：平台已发货 → 终态，单次请求即返回，绝不重试。"""
+        result, requests, _ = self._run_confirm(
+            [{'ret': ['ORDER_ALREADY_DELIVERY::已发货成功，请刷新页面~']}],
+            trade_text='https://pan.quark.cn/s/abc\n提取码：8k2p')
+        self.assertFalse(result.get('success'))
+        self.assertTrue(result.get('order_already_delivered'))
+        self.assertTrue(result.get('order_status_error'))
+        self.assertTrue(result.get('stop_confirm_retry'))
+        self.assertEqual(len(requests), 1)
+
+
+class NonRetryableClassifierTests(unittest.TestCase):
+    def test_order_already_delivery_text_is_non_retryable(self):
+        live = _direct_live('cls-unit')
+        self.assertTrue(live._is_non_retryable_platform_confirm_error(
+            '自动确认发货失败: ORDER_ALREADY_DELIVERY::已发货成功，请刷新页面~'))
+
+    def test_flagged_result_is_non_retryable(self):
+        live = _direct_live('cls-unit')
+        self.assertTrue(live._is_non_retryable_platform_confirm_error(
+            '业务错误', {'order_already_delivered': True}))
+
+
 class TradeTextBuilderTests(unittest.TestCase):
     def test_baidu_link_and_code(self):
         body = XianyuLive.build_trade_text_body('链接: https://pan.baidu.com/s/1aBcDe 提取码: 8k2p')
@@ -355,6 +379,58 @@ class GapHandlerTests(unittest.TestCase):
         live._auto_delivery.assert_not_awaited()
         statuses = [c.kwargs.get('status') for c in live._persist_delivery_finalization_state.call_args_list]
         self.assertEqual(statuses.count('finalized'), 2)
+
+    def test_order_already_delivery_escalates_manual(self):
+        """P0灰度实测：平台对已发货订单返回 ORDER_ALREADY_DELIVERY（非 ORDER_STATUS_ERROR），
+        必须走「升级人工」告警分支，而不是掉进笼统失败。"""
+        live = self._gap_live(sent_units=[1, 2])
+        # 模拟原始字符串直返（不带任何分类标志），验证字符串兜底判定
+        live.auto_confirm = mock.AsyncMock(return_value={
+            'error': 'ORDER_ALREADY_DELIVERY::已发货成功，请刷新页面~'})
+
+        result = asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+        self.assertFalse(result)
+        alerted = live._send_ops_alert.call_args
+        self.assertTrue(alerted.args[0].startswith('delivery_gap:'))
+        self.assertIn('ORDER_ALREADY_DELIVERY', alerted.args[1])
+        self.assertIn('人工', alerted.args[1])
+
+    def test_flagged_already_delivered_escalates_without_string(self):
+        live = self._gap_live(sent_units=[1, 2])
+        live.auto_confirm = mock.AsyncMock(return_value={
+            'error': '业务错误', 'order_already_delivered': True, 'order_status_error': True})
+
+        result = asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+        self.assertFalse(result)
+        self.assertIn('人工', live._send_ops_alert.call_args.args[1])
+
+    def test_manual_delivery_success_resolves_gap(self):
+        """运营方已在控制台手动补发过的单子：直接结案，不再反复告警/补写。"""
+        import db_manager as dbm
+        live = self._gap_live(sent_units=[])
+        live._get_pending_delivery_finalization_meta = lambda order_id, unit: None
+
+        with mock.patch.object(dbm.db_manager, 'has_manual_delivery_success', return_value=True):
+            result = asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+
+        self.assertTrue(result)
+        live.auto_confirm.assert_not_awaited()
+        live._send_ops_alert.assert_not_awaited()
+        statuses = [c.kwargs.get('status') for c in live._persist_delivery_finalization_state.call_args_list]
+        self.assertEqual(statuses, ['finalized', 'finalized'])
+        channels = [c.kwargs.get('channel') for c in live._persist_delivery_finalization_state.call_args_list]
+        self.assertTrue(all(ch == 'manual_confirm' for ch in channels))
+
+    def test_no_manual_record_still_alerts(self):
+        import db_manager as dbm
+        live = self._gap_live(sent_units=[])
+        live._get_pending_delivery_finalization_meta = lambda order_id, unit: None
+
+        with mock.patch.object(dbm.db_manager, 'has_manual_delivery_success', return_value=False):
+            result = asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+
+        self.assertFalse(result)
+        live._send_ops_alert.assert_awaited_once()
 
     def test_order_status_error_escalates_manual(self):
         live = self._gap_live(sent_units=[1, 2])

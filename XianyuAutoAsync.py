@@ -4236,6 +4236,36 @@ class XianyuLive:
         if summary.get('finalized_unit_indexes'):
             return False  # 有完成记录，非缺口
 
+        # 运营方已在控制台手动补发过（channel='manual' + status='success'）→ 直接结案，
+        # 不再反复告警/补写；闲鱼App内人工发消息无日志，此检查覆盖不到
+        try:
+            if db_manager.has_manual_delivery_success(order_id):
+                logger.warning(
+                    f"【{self.cookie_id}】{source} 缺口订单检测到人工补发成功记录，直接结案: {order_id}"
+                )
+                for unit_index in range(1, quantity + 1):
+                    self._persist_delivery_finalization_state(
+                        order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                        delivery_meta={'success': True, 'delivery_unit_index': unit_index,
+                                       'manual_confirmed': True},
+                        channel='manual_confirm', status='finalized',
+                    )
+                self._sync_order_delivery_progress(
+                    order_id=order_id, cookie_id=self.cookie_id, expected_quantity=quantity,
+                    context=f'{source} 检测到人工补发成功记录，缺口结案',
+                )
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='success', reason=f'{source} 履约缺口结案：检测到人工补发成功记录',
+                    channel='manual_confirm',
+                )
+                return True
+        except Exception as manual_check_error:
+            logger.warning(
+                f"【{self.cookie_id}】{source} 人工补发记录检查失败（继续按缺口处理）: "
+                f"order_id={order_id}, {self._safe_str(manual_check_error)}"
+            )
+
         sent_units = list(summary.get('pending_finalize_unit_indexes') or [])
         try:
             db_manager.add_risk_control_log(
@@ -4306,11 +4336,17 @@ class XianyuLive:
                     return True
 
                 error_text = str(confirm_result.get('error') or '未知错误')
-                order_status_error = bool(confirm_result.get('order_status_error')) or 'ORDER_STATUS_ERROR' in error_text
+                # P0灰度实测：平台对已发货订单返回 ORDER_ALREADY_DELIVERY（非 ORDER_STATUS_ERROR）
+                order_status_error = (
+                    bool(confirm_result.get('order_status_error'))
+                    or 'ORDER_STATUS_ERROR' in error_text
+                    or 'ORDER_ALREADY_DELIVERY' in error_text
+                )
                 if order_status_error:
                     await self._send_ops_alert(
                         f'delivery_gap:{order_id}',
-                        f"⚠️ 履约缺口需人工处理: 订单 {order_id} 平台已发货且不允许补写发货凭证（ORDER_STATUS_ERROR），"
+                        f"⚠️ 履约缺口需人工处理: 订单 {order_id} 平台已发货且不允许补写发货凭证"
+                        f"（{'ORDER_ALREADY_DELIVERY' if 'ORDER_ALREADY_DELIVERY' in error_text else 'ORDER_STATUS_ERROR'}），"
                         f"请人工私信补发。\n买家: {buyer_nick or buyer_id or '-'}\n"
                         f"{'链接: ' + '、'.join(links_hint) if links_hint else '（见已送达记录）'}",
                         cooldown_seconds=7200)
@@ -4388,11 +4424,15 @@ class XianyuLive:
         error_text = str(error or '')
         if isinstance(confirm_result, dict) and (
             confirm_result.get('order_status_error')
+            or confirm_result.get('order_already_delivered')
             or confirm_result.get('non_retryable')
             or confirm_result.get('stop_confirm_retry')
         ):
             return True
-        return 'ORDER_STATUS_ERROR' in error_text or '订单状态不正确' in error_text
+        # ORDER_ALREADY_DELIVERY（P0灰度实测）：平台已发货的终态，绝不能进入补确认重试循环
+        return ('ORDER_STATUS_ERROR' in error_text
+                or 'ORDER_ALREADY_DELIVERY' in error_text
+                or '订单状态不正确' in error_text)
 
     def _mark_delivery_platform_confirm_no_longer_required(self, order_id: str, item_id: str, buyer_id: str,
                                                            delivery_meta: dict = None, reason: str = '',
