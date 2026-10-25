@@ -7489,6 +7489,51 @@ Cookie数量: {cookie_count}
                 logger.error(f"查询待发货订单列表失败: cookie_id={cookie_id} - {e}")
                 return []
 
+    def get_shipped_orders_without_finalization(self, cookie_id: str, within_hours: int = 24, limit: int = 20) -> list:
+        """获取「平台已发货但本地无 finalized 完成记录」的缺口订单（履约一致性巡检用）。
+
+        命中即疑似假发货事故：平台侧 shipped、买家却没收到内容（本地从未 sent/finalized，
+        或有 sent 但从未收尾）。只读，不做任何回填。
+        """
+        if not cookie_id:
+            return []
+        safe_hours = max(1, min(int(within_hours or 24), 24 * 7))
+        safe_limit = max(1, min(int(limit or 20), 100))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT o.order_id, o.item_id, o.buyer_id, o.buyer_nick, o.sid, o.order_status, o.updated_at
+                    FROM orders o
+                    WHERE o.cookie_id = ?
+                      AND o.order_status = 'shipped'
+                      AND datetime(o.updated_at) > datetime('now', ?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_finalization_states s
+                          WHERE s.order_id = o.order_id AND s.status = 'finalized'
+                      )
+                    ORDER BY datetime(o.updated_at) ASC
+                    LIMIT ?
+                    ''',
+                    (cookie_id, f'-{safe_hours} hours', safe_limit)
+                )
+                return [
+                    {
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': row[3],
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'updated_at': row[6],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"查询履约缺口订单失败: cookie_id={cookie_id} - {e}")
+                return []
+
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
         """根据Cookie ID获取订单列表"""
         with self.lock:

@@ -14600,6 +14600,53 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
 
         ws = getattr(xianyu_instance, 'ws', None)
         manual_chat_id = buyer_id
+
+        # 发货凭证直填优先：与私聊 WebSocket 解耦，账号断连时手动发货也能完成平台发货；
+        # 不适用或失败(允许回落)时继续走下方私聊链路
+        if prepared_units:
+            trade_direct_result = await xianyu_instance._deliver_via_trade_text_direct(
+                order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                buyer_nick=order.get('buyer_nick'),
+                prepared_units=prepared_units,
+                websocket=ws,
+                chat_id=(order.get('sid', '').replace('@goofish', '') if ws and order.get('sid') else ''),
+                source='manual_deliver',
+                allow_dedicated_socket_supplement=True,
+            )
+            if trade_direct_result:
+                publish_order_update_event(order_id, source='manual_delivery_trade_text')
+                log_with_user('info', f"手动发货: 订单 {order_id} 已通过平台发货凭证直填发货（私聊补充告知已尽力发送）", current_user)
+                return {
+                    "success": True,
+                    "delivered": True,
+                    "channel": "trade_text",
+                    "message": "已通过平台发货凭证直填发货（含网盘链接与提取码），私聊补充通知尽力发送",
+                }
+            if trade_direct_result is False and not xianyu_instance._is_trade_text_fallback_to_chat_enabled():
+                for prepared_unit in prepared_units:
+                    unit_rule_meta = prepared_unit.get('rule_meta') or {}
+                    xianyu_instance._release_data_reservation_if_needed(
+                        unit_rule_meta,
+                        error=f"手动发货凭证直填失败(单元={prepared_unit.get('unit_index') or 1})"
+                    )
+                failure_message = "发货凭证直填失败且已关闭私聊回落，请检查平台接口后重试"
+                db_manager.create_delivery_log(
+                    user_id=user_id,
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    buyer_nick=order.get('buyer_nick'),
+                    rule_id=None,
+                    rule_keyword=None,
+                    card_type=None,
+                    match_mode=None,
+                    channel='trade_text',
+                    status='failed',
+                    reason=failure_message,
+                )
+                return {"success": False, "delivered": False, "message": failure_message}
+
         if ws:
             sid = order.get('sid', '')
             if sid:

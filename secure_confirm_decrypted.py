@@ -10,6 +10,9 @@ import aiohttp
 from loguru import logger
 from utils.xianyu_utils import generate_sign, trans_cookies, get_consistent_browser_identity
 
+# 发货凭证（tradeText）长度硬上限；可被 auto_confirm(trade_text_max_length=...) 覆盖用于灰度压测
+MAX_TRADE_TEXT_LENGTH = 500
+
 
 class SecureConfirm:
     """自动确认发货类"""
@@ -137,11 +140,25 @@ class SecureConfirm:
             logger.error(f"【{self.cookie_id}】更新数据库Cookie失败: {self._safe_str(e)}")
 
 
-    async def auto_confirm(self, order_id, item_id=None, retry_count=0):
-        """自动确认发货 - 使用真实商品ID刷新token"""
+    async def auto_confirm(self, order_id, item_id=None, retry_count=0, trade_text: str = '',
+                           trade_text_max_length: int = None):
+        """自动确认发货 - 使用真实商品ID刷新token
+
+        Args:
+            trade_text: 发货凭证正文（写入订单详情页的发货留言，网盘链接+提取码）。
+                为空时 data_val 与旧版逐字节一致，行为完全不变。
+            trade_text_max_length: 凭证正文长度上限；None 时用模块默认 500。
+                P0 灰度验证超长场景时可显式放大。
+        """
         if retry_count >= 4:  # 最多重试3次
             logger.error("自动确认发货失败，重试次数过多")
             return {"error": "自动确认发货失败，重试次数过多"}
+
+        try:
+            max_trade_len = int(trade_text_max_length) if trade_text_max_length else MAX_TRADE_TEXT_LENGTH
+        except (TypeError, ValueError):
+            max_trade_len = MAX_TRADE_TEXT_LENGTH
+        safe_trade_text = str(trade_text or '').strip()[:max(0, max_trade_len)]
 
         # 保存item_id供Token刷新使用
         if item_id:
@@ -162,7 +179,16 @@ class SecureConfirm:
             'sessionOption': 'AutoLoginOnly',
         }
 
-        data_val = '{"orderId":"' + order_id + '", "tradeText":"","picList":[],"newUnconsign":true}'
+        # 签名一致性红线：sign 必须由最终发送的 data_val 逐字节同源计算（下方 generate_sign）。
+        # 紧凑 JSON 序列化；空凭证时与旧版仅差 orderId 后一个空格，JSON 语义等价且签名同源。
+        data_val = json.dumps({
+            "orderId": str(order_id or ''),
+            "tradeText": safe_trade_text,
+            "picList": [],
+            "newUnconsign": True,
+        }, ensure_ascii=False, separators=(',', ':'))
+        if safe_trade_text:
+            logger.info(f"【{self.cookie_id}】发货凭证直填模式: order_id={order_id}, 凭证长度={len(safe_trade_text)}")
         data = {
             'data': data_val,
         }
@@ -240,7 +266,9 @@ class SecureConfirm:
                                 "confirm_retry_required": False,
                             }
 
-                        return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                        return await self.auto_confirm(order_id, item_id, retry_count + 1,
+                                                       trade_text=trade_text,
+                                                       trade_text_max_length=trade_text_max_length)
 
 
         except Exception as e:
@@ -250,6 +278,8 @@ class SecureConfirm:
             # 网络异常也进行重试
             if retry_count < 2:
                 logger.info(f"【{self.cookie_id}】网络异常，准备重试...")
-                return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                return await self.auto_confirm(order_id, item_id, retry_count + 1,
+                                               trade_text=trade_text,
+                                               trade_text_max_length=trade_text_max_length)
 
             return {"error": f"网络异常: {self._safe_str(e)}", "order_id": order_id}

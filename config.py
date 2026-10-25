@@ -147,6 +147,25 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     # 拟人化：夜间窗口内自动回复延迟拉长(秒)，模拟卖家睡觉；白天固定 2~10 秒
     'night_reply_delay_range': [60, 480],
     'auto_captcha_recovery_enabled': False,
+    # 履约一致性巡检：平台 shipped 但本地无 finalized 的扫描间隔（秒）
+    'delivery_gap_scan_interval': 300,
+    # 巡检命中后是否自动尝试补写发货凭证（仅在已有已送达内容时，绝不新发卡密）
+    'delivery_gap_auto_retry': True,
+    # 待发货订单滞留多少分钟后告警运营方
+    'delivery_gap_pending_ship_alert_minutes': 15,
+    # 发货失败（私聊回执超时等）是否主动告警运营方
+    'delivery_failure_alert_enabled': True,
+})
+# 发货凭证直填（tradeText）链路：与私聊 WebSocket 解耦的主发货通道
+DELIVERY = config.get('DELIVERY', {
+    # tradeText 发货凭证直填总开关（灰度用；false 时行为与旧私聊链路完全一致）
+    'trade_text_enabled': True,
+    # 发货凭证长度上限（字符）
+    'trade_text_max_length': 500,
+    # 凭证失败时是否回落旧私聊链路（true = 不倒退）
+    'trade_text_fallback_to_chat': True,
+    # 私聊补充告知失败是否忽略（true = 不影响履约）
+    'chat_notify_best_effort': True,
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):

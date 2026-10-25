@@ -88,6 +88,24 @@ RISK_CONTROL:
   night_reply_delay_range: [60, 480]
   # 自动滑块恢复默认关闭：pureCaptcha/RGV587 是纯黑处罚页，继续拉浏览器会被当成脚本升级封禁
   auto_captcha_recovery_enabled: false
+  # 履约一致性巡检：平台 shipped 但本地无 finalized 的扫描间隔（秒）
+  delivery_gap_scan_interval: 300
+  # 巡检命中后是否自动尝试补写发货凭证（仅在已有已送达内容时补写，绝不新发卡密）
+  delivery_gap_auto_retry: true
+  # 待发货订单滞留多少分钟后告警运营方
+  delivery_gap_pending_ship_alert_minutes: 15
+  # 发货失败（私聊回执超时等）是否主动告警运营方
+  delivery_failure_alert_enabled: true
+DELIVERY:
+  # 发货凭证直填（tradeText）总开关：网盘链接+提取码直接写进平台发货凭证，HTTP 发货与私聊解耦；
+  # 置 false 完全回落旧私聊链路（行为与改造前一致），灰度回滚只改这一行
+  trade_text_enabled: true
+  # 发货凭证长度上限（字符），超长截断
+  trade_text_max_length: 500
+  # 凭证接口失败时是否回落旧私聊链路（true = 不倒退）
+  trade_text_fallback_to_chat: true
+  # 私聊补充告知失败是否忽略（true = 平台凭证已发货，私聊失败不影响履约）
+  chat_notify_best_effort: true
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟

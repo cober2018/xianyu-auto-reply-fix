@@ -23,7 +23,7 @@ from config import (
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL,
     SESSION_KEEPALIVE_INTERVAL, SESSION_KEEPALIVE_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL
+    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL, DELIVERY
 )
 # from app.logging_config import setup_logging  # 已移除，模块不存在
 import sys
@@ -2193,6 +2193,10 @@ class XianyuLive:
         # 自动确认发货防重复机制
         self.confirmed_orders = {}  # 记录已确认发货的订单，防止重复确认
         self.order_confirm_cooldown = 600  # 10分钟内不重复确认同一订单
+        # 履约一致性巡检与运营告警状态（发货凭证直填链路配套）
+        self._ops_alert_last_sent = {}        # 运营告警每 key 冷却（发送成功/失败都进冷却，防风暴）
+        self._delivery_gap_attempt_last = {}  # 缺口订单补写发货凭证的尝试冷却
+        self._delivery_gap_patrol_task = None  # 履约一致性巡检任务（与WebSocket连接状态无关）
         self.pending_platform_confirm_retry_lock = asyncio.Lock()  # 待补确认自动重试锁
         self.last_pending_platform_confirm_retry_time = 0.0
         self.pending_platform_confirm_retry_cooldown = 60  # 1分钟内不重复自动扫描待补确认订单
@@ -3660,6 +3664,18 @@ class XianyuLive:
                 status=normalized_status,
                 reason=self._format_delivery_log_reason(reason, meta)
             )
+
+            # 发货失败主动告警运营方（带冷却；通知失败也进冷却，防风暴）
+            if normalized_status == 'failed' and RISK_CONTROL.get('delivery_failure_alert_enabled', True):
+                try:
+                    self._create_tracked_task(self._send_ops_alert(
+                        f'delivery_failed:{order_id or item_id or "unknown"}',
+                        f"❌ 自动发货失败\n订单: {order_id or '-'}\n商品: {item_id or '-'}\n"
+                        f"买家: {resolved_buyer_nick or buyer_id or '-'}\n"
+                        f"原因: {str(reason or '未知')[:150]}",
+                        cooldown_seconds=7200))
+                except Exception:
+                    pass
         except Exception as log_e:
             logger.error(f"【{self.cookie_id}】记录发货日志失败: {self._safe_str(log_e)}")
 
@@ -3805,6 +3821,510 @@ class XianyuLive:
 
         from db_manager import db_manager
         return db_manager.release_batch_data_reservation(reservation_id, error=error)
+
+    # ══════════════ 发货凭证直填（tradeText）双通道链路 ══════════════
+    # 设计：平台发货凭证（tradeText）走 HTTP consign 接口直填网盘链接+提取码，
+    # 与私聊 WebSocket 解耦；私聊降级为"锦上添花"的补充告知通道。
+
+    _TRADE_TEXT_FORBIDDEN_TOKENS = (
+        '防屏蔽', '备用通道', '回复1', '回复 1', '回复①', '自救', '加微信', '加V', '私信我',
+    )
+
+    def _is_trade_text_delivery_enabled(self) -> bool:
+        try:
+            return bool(DELIVERY.get('trade_text_enabled', True))
+        except Exception:
+            return True
+
+    def _get_trade_text_max_length(self) -> int:
+        try:
+            return max(50, min(int(DELIVERY.get('trade_text_max_length', 500) or 500), 2000))
+        except (TypeError, ValueError):
+            return 500
+
+    def _is_trade_text_fallback_to_chat_enabled(self) -> bool:
+        try:
+            return bool(DELIVERY.get('trade_text_fallback_to_chat', True))
+        except Exception:
+            return True
+
+    def _is_chat_notify_best_effort_enabled(self) -> bool:
+        try:
+            return bool(DELIVERY.get('chat_notify_best_effort', True))
+        except Exception:
+            return True
+
+    @staticmethod
+    def extract_first_url(text) -> str:
+        """提取文本中第一个 http(s) 链接（图片卡券标记直接排除）。"""
+        raw = str(text or '')
+        if not raw or raw.startswith('__IMAGE_SEND__'):
+            return ''
+        match = re.search(r'https?://[^\s<>"\']+', raw)
+        if not match:
+            return ''
+        return match.group(0).rstrip('，。；、,.;！!？?）)】]」」"\'')
+
+    @staticmethod
+    def extract_extraction_code(text) -> str:
+        """提取网盘提取码：优先"提取码/密码/pwd"标签，其次链接后紧跟的独立短码。"""
+        raw = str(text or '')
+        if not raw:
+            return ''
+
+        labeled = re.search(
+            r'(?:提取码|提取碼|访问码|訪問碼|密码|密碼|pwd|passcode)\s*[:：为是]?\s*([A-Za-z0-9]{4,10})',
+            raw, flags=re.IGNORECASE)
+        if labeled:
+            return labeled.group(1)
+
+        url_match = re.search(r'https?://[^\s<>"\']+', raw)
+        if url_match:
+            tail = raw[url_match.end():url_match.end() + 40]
+            unlabeled = re.match(r'^[\s,，]*([A-Za-z0-9]{4,8})(?![A-Za-z0-9])', tail)
+            if unlabeled:
+                candidate = unlabeled.group(1)
+                has_digit = any(ch.isdigit() for ch in candidate)
+                all_upper_alpha = candidate.isalpha() and candidate.isupper()
+                if has_digit or all_upper_alpha:
+                    return candidate
+        return ''
+
+    @classmethod
+    def build_trade_text_body(cls, delivery_content, card_description: str = '', max_length: int = 500) -> str:
+        """纯函数：由发货内容构造凭证正文（主链接 + 提取码 + 白名单说明）。
+
+        只放链接与提取码，不放长文案；说明含诱导话术则整体丢弃；无链接返回空串。
+        """
+        raw = str(delivery_content or '')
+        link = cls.extract_first_url(raw)
+        if not link:
+            return ''
+        try:
+            limit = max(1, int(max_length or 500))
+        except (TypeError, ValueError):
+            limit = 500
+
+        parts = [link]
+        code = cls.extract_extraction_code(raw)
+        if code:
+            parts.append(f'提取码：{code}')
+        desc = str(card_description or '').strip()[:60]
+        if desc and not any(token in desc for token in cls._TRADE_TEXT_FORBIDDEN_TOKENS):
+            parts.append(desc)
+        return '\n'.join(parts)[:limit]
+
+    @classmethod
+    def build_order_trade_text(cls, unit_payloads, max_length: int = 500) -> str:
+        """整单凭证正文：每个发货单元一块（链接+提取码），单块 \\n 分隔。
+
+        任一单元提取不出链接 → 返回空串，整单回落旧私聊链路（保证不半发）。
+        """
+        try:
+            limit = max(1, int(max_length or 500))
+        except (TypeError, ValueError):
+            limit = 500
+        blocks = []
+        for payload in unit_payloads or []:
+            body = cls.build_trade_text_body(payload, max_length=limit)
+            if not body:
+                return ''
+            blocks.append(body)
+        if not blocks:
+            return ''
+        return '\n'.join(blocks)[:limit]
+
+    def _build_trade_text(self, delivery_content: str, card_description: str = '') -> str:
+        """实例入口：受配置开关与长度上限约束的凭证正文构造。"""
+        if not self._is_trade_text_delivery_enabled():
+            return ''
+        return self.build_trade_text_body(
+            delivery_content,
+            card_description=card_description,
+            max_length=self._get_trade_text_max_length(),
+        )
+
+    async def _deliver_via_trade_text_direct(self, *, order_id: str, item_id: str, buyer_id: str,
+                                             buyer_nick: str = '', prepared_units: list,
+                                             websocket=None, chat_id: str = '', user_url: str = None,
+                                             source: str = 'auto',
+                                             allow_dedicated_socket_supplement: bool = False):
+        """发货凭证直填主通道：网盘链接+提取码直写平台发货凭证（HTTP，不依赖私聊）。
+
+        返回值约定：
+            True  = 平台凭证发货成功，本地各单元已收尾，私聊补充告知已尽力发送；
+            False = 已尝试直填但平台接口失败（调用方按 trade_text_fallback_to_chat 决定回落）；
+            None  = 直填不适用（开关关闭/无链接/已有在途单元/冷却期内/未开自动确认）。
+        """
+        from db_manager import db_manager  # noqa: F401  (保持与相邻链路一致的局部导入风格)
+
+        try:
+            if not order_id or not item_id or not buyer_id or not prepared_units:
+                return None
+            if not self._is_trade_text_delivery_enabled() or not self.is_auto_confirm_enabled():
+                return None
+
+            last_confirm = self.confirmed_orders.get(order_id, 0)
+            if last_confirm and time.time() - last_confirm < self.order_confirm_cooldown:
+                return None
+
+            # 只有无在途单元的全新订单走直填；已有 sent/finalized 的订单交给收尾/Partial 链路，
+            # 避免与"私聊 ACK 成功后才整单确认"的原子规则互相踩踏。
+            quantity = self._get_order_expected_delivery_quantity(order_id)
+            summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
+            if (summary.get('finalized_unit_indexes') or []) or (summary.get('pending_finalize_unit_indexes') or []):
+                logger.info(f"【{self.cookie_id}】{source} 订单已有在途发货单元，跳过发货凭证直填: {order_id}")
+                return None
+
+            unit_payloads = []
+            for prepared_unit in prepared_units:
+                steps = prepared_unit.get('delivery_steps') or []
+                text_contents = [str(step.get('content') or '') for step in steps if step.get('type') == 'text']
+                joined = '\n'.join([c for c in text_contents if c.strip()])
+                if not joined:
+                    logger.info(f"【{self.cookie_id}】{source} 单元含非文本卡券，整单回落私聊链路: {order_id}")
+                    return None
+                unit_payloads.append(joined)
+
+            trade_text = self.build_order_trade_text(unit_payloads, max_length=self._get_trade_text_max_length())
+            if not trade_text:
+                logger.info(f"【{self.cookie_id}】{source} 发货内容无可提取网盘链接，跳过凭证直填: {order_id}")
+                return None
+
+            logger.warning(
+                f"【{self.cookie_id}】{source} 发货凭证直填优先（与私聊解耦）: "
+                f"order_id={order_id}, 单元数={len(prepared_units)}, 凭证长度={len(trade_text)}"
+            )
+            confirm_result = await self.auto_confirm(order_id, item_id, trade_text=trade_text)
+            if not confirm_result.get('success'):
+                error_text = confirm_result.get('error') or '未知错误'
+                logger.warning(
+                    f"【{self.cookie_id}】{source} 发货凭证直填失败: order_id={order_id}, error={error_text}"
+                )
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='failed', reason=f'发货凭证直填失败: {error_text}',
+                    channel='trade_text',
+                )
+                return False
+
+            self.confirmed_orders[order_id] = time.time()
+
+            # 平台凭证已发货成功：逐单元标记送达+收尾（消费卡密；不再触发平台确认）
+            for prepared_unit in prepared_units:
+                unit_index = prepared_unit.get('unit_index') or 1
+                rule_meta = prepared_unit.get('rule_meta') or {}
+                if not self._mark_data_reservation_sent_if_needed(rule_meta):
+                    logger.error(
+                        f"【{self.cookie_id}】{source} 单元 {unit_index} 凭证直填成功但标记预占失败，卡密不释放: {order_id}"
+                    )
+                finalize_result = await self._finalize_delivery_after_send(
+                    delivery_meta=rule_meta, order_id=order_id, item_id=item_id, skip_confirm=True)
+                if finalize_result.get('success'):
+                    self._persist_delivery_finalization_state(
+                        order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                        delivery_meta=rule_meta, channel='trade_text', status='finalized')
+                else:
+                    self._persist_delivery_finalization_state(
+                        order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                        delivery_meta=rule_meta, channel='trade_text', status='sent',
+                        last_error=finalize_result.get('error') or '凭证直填成功但本地消费收尾失败')
+
+            self._sync_order_delivery_progress(
+                order_id=order_id, cookie_id=self.cookie_id,
+                expected_quantity=quantity, context=f'{source} 发货凭证直填成功',
+            )
+            self._activate_delivery_lock(order_id, delay_minutes=10)
+            self._record_delivery_log(
+                order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                status='success',
+                reason=f'{source} 发货凭证直填成功（平台凭证已含网盘链接与提取码）',
+                channel='trade_text',
+            )
+            logger.warning(f"【{self.cookie_id}】{source} 发货凭证直填成功: order_id={order_id}")
+
+            # 私聊降级为补充告知：失败不影响履约
+            await self._send_chat_supplement_after_trade_text(
+                order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                prepared_units=prepared_units, websocket=websocket, chat_id=chat_id,
+                user_url=user_url, source=source,
+                allow_dedicated_socket=allow_dedicated_socket_supplement,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】{source} 发货凭证直填异常: order_id={order_id}, error={self._safe_str(e)}")
+            return False
+
+    async def _send_chat_supplement_after_trade_text(self, *, order_id: str, item_id: str, buyer_id: str,
+                                                     prepared_units: list, websocket=None, chat_id: str = '',
+                                                     user_url: str = None, source: str = 'auto',
+                                                     allow_dedicated_socket: bool = False):
+        """凭证直填成功后的私聊补充告知（best-effort，失败不影响履约）。"""
+        best_effort = self._is_chat_notify_best_effort_enabled()
+        try:
+            steps = []
+            for prepared_unit in prepared_units or []:
+                steps.extend(prepared_unit.get('delivery_steps') or [])
+            if not steps:
+                return
+
+            if websocket and chat_id:
+                await self._send_delivery_steps(
+                    websocket, chat_id, buyer_id, steps,
+                    user_url=user_url,
+                    log_prefix=f'{source} 凭证直填后私聊补充告知',
+                )
+                logger.info(f"【{self.cookie_id}】{source} 私聊补充告知发送成功: {order_id}")
+                return
+            if allow_dedicated_socket:
+                await self.send_delivery_steps_once(buyer_id, item_id, steps)
+                logger.info(f"【{self.cookie_id}】{source} 私聊补充告知（独立连接）发送成功: {order_id}")
+                return
+            logger.info(
+                f"【{self.cookie_id}】{source} 当前无私聊通道，跳过补充告知（平台凭证已发货）: {order_id}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if best_effort:
+                logger.warning(
+                    f"【{self.cookie_id}】{source} 发货凭证已直填成功，私聊补充告知失败（不影响履约）: "
+                    f"order_id={order_id}, error={self._safe_str(e)}"
+                )
+            else:
+                logger.error(
+                    f"【{self.cookie_id}】{source} 发货凭证直填成功但私聊补充告知失败: "
+                    f"order_id={order_id}, error={self._safe_str(e)}"
+                )
+                try:
+                    self._create_tracked_task(self._send_ops_alert(
+                        f'chat_supplement_failed:{order_id}',
+                        f"订单 {order_id} 已通过平台发货凭证直填发货，但私聊补充告知发送失败"
+                        f"（买家可在订单详情页查看网盘链接与提取码）。",
+                        cooldown_seconds=7200))
+                except Exception:
+                    pass
+
+    # ══════════════ 履约一致性巡检（假发货缺口自愈） ══════════════
+
+    async def _send_ops_alert(self, alert_key: str, message: str, cooldown_seconds: float = 7200) -> bool:
+        """运营告警：每 key 冷却；发送失败也进冷却（防告警风暴/自旋）。"""
+        now = time.time()
+        if now - self._ops_alert_last_sent.get(alert_key, 0.0) < cooldown_seconds:
+            return False
+        self._ops_alert_last_sent[alert_key] = now
+        try:
+            sent = await dispatch_account_notifications(
+                self.cookie_id, message,
+                title='闲鱼履约异常告警', notification_type='delivery_ops_alert')
+            if not sent:
+                logger.warning(f"【{self.cookie_id}】运营告警未送达（未配置通道或发送失败，已进冷却）: {alert_key}")
+            return bool(sent)
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】运营告警发送异常: {alert_key}, {self._safe_str(e)}")
+            return False
+
+    @staticmethod
+    def _parse_db_datetime_age_seconds(text) -> Optional[float]:
+        try:
+            raw = str(text or '').strip()
+            if not raw:
+                return None
+            normalized = raw.replace('T', ' ')[:19]
+            dt = datetime.strptime(normalized, '%Y-%m-%d %H:%M:%S')
+            return max(0.0, (datetime.now() - dt).total_seconds())
+        except (ValueError, TypeError):
+            return None
+
+    async def _delivery_consistency_patrol_loop(self):
+        """履约一致性巡检主循环：与 WebSocket 连接状态无关。
+
+        - 识别「平台已发货但本地无完成记录」的缺口订单（假发货事故）并告警/补写凭证；
+        - 监控待发货订单滞留并告警；
+        - 登录退避静默期只做只读检测+告警，绝不发起网络请求。
+        """
+        logger.info(f"【{self.cookie_id}】履约一致性巡检启动（假发货缺口/滞留告警）")
+        while True:
+            try:
+                interval = max(120, int(RISK_CONTROL.get('delivery_gap_scan_interval', 300) or 300))
+            except (TypeError, ValueError):
+                interval = 300
+            await self._interruptible_sleep(interval)
+            try:
+                from cookie_manager import manager as cookie_manager
+                if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                    logger.info(f"【{self.cookie_id}】账号已禁用，履约一致性巡检退出")
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                await self._scan_delivery_gap_orders()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"【{self.cookie_id}】履约一致性巡检异常: {self._safe_str(e)}")
+
+    async def _scan_delivery_gap_orders(self, limit: int = 10) -> int:
+        from db_manager import db_manager
+
+        handled = 0
+        try:
+            gap_orders = await asyncio.to_thread(
+                db_manager.get_shipped_orders_without_finalization, self.cookie_id, 24, limit)
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】履约缺口扫描失败: {self._safe_str(e)}")
+            gap_orders = []
+
+        for order in gap_orders or []:
+            try:
+                if await self._handle_delivery_gap_order(order, source='delivery_gap_patrol'):
+                    handled += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"【{self.cookie_id}】履约缺口处理异常: order_id={order.get('order_id')}, {self._safe_str(e)}"
+                )
+
+        # 待发货滞留告警（只读；补发由看门狗/扫码巡检负责，这里只负责让运营方看见）
+        try:
+            alert_minutes = max(5, int(RISK_CONTROL.get('delivery_gap_pending_ship_alert_minutes', 15) or 15))
+            pending_orders = await asyncio.to_thread(db_manager.get_pending_ship_orders, self.cookie_id, 10)
+            for order in pending_orders or []:
+                order_id = str(order.get('order_id') or '').strip()
+                if not order_id:
+                    continue
+                age_seconds = self._parse_db_datetime_age_seconds(order.get('updated_at'))
+                if age_seconds is None or age_seconds < alert_minutes * 60:
+                    continue
+                quantity = self._get_order_expected_delivery_quantity(order_id)
+                summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
+                if summary.get('pending_finalize_unit_indexes') or summary.get('finalized_unit_indexes'):
+                    continue  # 已有在途/完成单元，链路在工作中
+                await self._send_ops_alert(
+                    f'pending_ship_stale:{order_id}',
+                    f"⏰ 待发货订单滞留 {int(age_seconds // 60)} 分钟未发货\n"
+                    f"订单: {order_id}\n买家: {order.get('buyer_nick') or order.get('buyer_id') or '-'}\n"
+                    f"商品: {order.get('item_id') or '-'}\n请检查账号在线状态与发货规则。",
+                    cooldown_seconds=7200)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】待发货滞留告警扫描失败: {self._safe_str(e)}")
+        return handled
+
+    async def _handle_delivery_gap_order(self, order, source: str = 'delivery_gap_patrol') -> bool:
+        """平台已发货（shipped）但本地无 finalized 的缺口订单处理。
+
+        铁律：绝不新发卡密——无法判断买家是否已收到，盲目重发=客诉/浪费卡密。
+        只允许：a) 用「已送达记录里的内容」补写发货凭证；b) 告警人工核实补发。
+        """
+        from db_manager import db_manager
+
+        order = order or {}
+        order_id = str(order.get('order_id') or '').strip()
+        item_id = str(order.get('item_id') or '').strip()
+        buyer_id = str(order.get('buyer_id') or '').strip()
+        buyer_nick = order.get('buyer_nick') or ''
+        if not order_id:
+            return False
+
+        quantity = self._get_order_expected_delivery_quantity(order_id)
+        summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
+        if summary.get('finalized_unit_indexes'):
+            return False  # 有完成记录，非缺口
+
+        sent_units = list(summary.get('pending_finalize_unit_indexes') or [])
+        try:
+            db_manager.add_risk_control_log(
+                cookie_id=self.cookie_id,
+                event_type='delivery_gap',
+                event_description=(
+                    f"平台已发货但本地无完成记录: order_id={order_id}, "
+                    f"buyer={buyer_nick or buyer_id or '-'}, sent_units={sent_units}"
+                ),
+                trigger_scene=source,
+                processing_status='processing',
+            )
+        except Exception as log_error:
+            logger.warning(f"【{self.cookie_id}】履约缺口风险日志写入失败: {order_id}, {self._safe_str(log_error)}")
+
+        sent_payloads = []
+        links_hint = []
+        for unit_index in sent_units:
+            unit_meta = self._get_pending_delivery_finalization_meta(order_id, unit_index) or {}
+            content = unit_meta.get('content') or unit_meta.get('data_line') or ''
+            if not content:
+                continue
+            sent_payloads.append(content)
+            link = self.extract_first_url(content)
+            if link:
+                links_hint.append(link)
+
+        auto_retry = bool(RISK_CONTROL.get('delivery_gap_auto_retry', True))
+        in_backoff = self._get_manual_qr_wait_seconds() > 0  # 退避静默期不发任何网络请求
+        attempt_key = f'delivery_gap_attempt:{order_id}'
+
+        if (auto_retry and not in_backoff and sent_payloads
+                and order_id not in self.confirmed_orders
+                and time.time() - self._delivery_gap_attempt_last.get(attempt_key, 0.0) >= 1800):
+            trade_text = self.build_order_trade_text(sent_payloads, max_length=self._get_trade_text_max_length())
+            if trade_text:
+                self._delivery_gap_attempt_last[attempt_key] = time.time()
+                logger.warning(
+                    f"【{self.cookie_id}】{source} 尝试为缺口订单补写发货凭证: {order_id}（内容来自已送达记录，不新发卡密）"
+                )
+                confirm_result = await self.auto_confirm(order_id, item_id or None, trade_text=trade_text)
+                if confirm_result.get('success'):
+                    self.confirmed_orders[order_id] = time.time()
+                    for unit_index in sent_units:
+                        unit_meta = self._get_pending_delivery_finalization_meta(order_id, unit_index) or {}
+                        finalize_result = await self._finalize_delivery_after_send(
+                            delivery_meta=unit_meta, order_id=order_id, item_id=item_id, skip_confirm=True)
+                        self._persist_delivery_finalization_state(
+                            order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                            delivery_meta=unit_meta, channel=source,
+                            status='finalized' if finalize_result.get('success') else 'sent',
+                            last_error=None if finalize_result.get('success') else (
+                                finalize_result.get('error') or '缺口补写凭证后本地收尾失败'),
+                        )
+                    self._sync_order_delivery_progress(
+                        order_id=order_id, cookie_id=self.cookie_id, expected_quantity=quantity,
+                        context=f'{source} 缺口订单补写发货凭证成功',
+                    )
+                    self._record_delivery_log(
+                        order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                        status='success', reason=f'{source} 缺口订单补写发货凭证成功（平台凭证已含链接）',
+                        channel=source,
+                    )
+                    await self._send_ops_alert(
+                        f'delivery_gap:{order_id}',
+                        f"✅ 履约缺口已自愈: 订单 {order_id} 平台发货凭证补写成功，买家可在订单详情页查看链接。",
+                        cooldown_seconds=7200)
+                    return True
+
+                error_text = str(confirm_result.get('error') or '未知错误')
+                order_status_error = bool(confirm_result.get('order_status_error')) or 'ORDER_STATUS_ERROR' in error_text
+                if order_status_error:
+                    await self._send_ops_alert(
+                        f'delivery_gap:{order_id}',
+                        f"⚠️ 履约缺口需人工处理: 订单 {order_id} 平台已发货且不允许补写发货凭证（ORDER_STATUS_ERROR），"
+                        f"请人工私信补发。\n买家: {buyer_nick or buyer_id or '-'}\n"
+                        f"{'链接: ' + '、'.join(links_hint) if links_hint else '（见已送达记录）'}",
+                        cooldown_seconds=7200)
+                    return False
+                logger.warning(f"【{self.cookie_id}】{source} 缺口订单补写发货凭证失败: {order_id}, {error_text}")
+
+        await self._send_ops_alert(
+            f'delivery_gap:{order_id}',
+            f"⚠️ 履约缺口: 平台已发货但本地无完成记录，买家可能未收到内容\n"
+            f"订单: {order_id}\n买家: {buyer_nick or buyer_id or '-'}\n商品: {item_id or '-'}\n"
+            f"{'链接: ' + '、'.join(links_hint) if links_hint else '（本地无已送达内容，请从卡券记录人工核实补发，切勿盲目重发）'}",
+            cooldown_seconds=7200)
+        return False
+
 
     def _get_pending_delivery_finalization_meta(self, order_id: str, delivery_unit_index: int = 1):
         if not order_id:
@@ -5009,6 +5529,36 @@ class XianyuLive:
 
             self._enter_fulfillment_priority()
             try:
+                # 发货凭证直填优先：本路径连会话ID都没有（私聊最难走通），凭证直填价值最大；
+                # 成功后用独立 WebSocket 连接尽力补发私聊告知，失败不影响履约
+                trade_direct_result = await self._deliver_via_trade_text_direct(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id,
+                    prepared_units=[{
+                        'unit_index': int(
+                            (delivery_meta.get('delivery_unit_index') if isinstance(delivery_meta, dict) else 1) or 1
+                        ),
+                        'delivery_steps': delivery_steps,
+                        'rule_meta': delivery_meta if isinstance(delivery_meta, dict) else {},
+                    }],
+                    source=f'{source}_without_sid',
+                    allow_dedicated_socket_supplement=True,
+                )
+                if trade_direct_result:
+                    return True
+                if trade_direct_result is False and not self._is_trade_text_fallback_to_chat_enabled():
+                    self._release_data_reservation_if_needed(
+                        delivery_meta, error='发货凭证直填失败且已关闭私聊回落')
+                    self._record_delivery_log(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        status='failed',
+                        reason='发货凭证直填失败且已关闭私聊回落',
+                        channel='trade_text',
+                        rule_meta=delivery_meta if isinstance(delivery_meta, dict) else None,
+                    )
+                    return False
+
                 await self.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
 
                 if not self._mark_data_reservation_sent_if_needed(delivery_meta):
@@ -5127,7 +5677,16 @@ class XianyuLive:
 
         if not order_id:
             return False
-        if db_manager._normalize_order_status(order.get('order_status')) != 'pending_ship':
+        normalized_order_status = db_manager._normalize_order_status(order.get('order_status'))
+        if normalized_order_status == 'shipped':
+            # G5：平台已发货但本地可能缺凭证/缺完成记录（假发货缺口）。
+            # 绝不自动重发卡密（无法判断买家是否已收到），交给缺口处理器：补写凭证或告警人工。
+            logger.warning(
+                f"【{self.cookie_id}】{source} 订单平台侧已发货，转入履约缺口处理（不重发卡密）: "
+                f"order_id={order_id}"
+            )
+            return await self._handle_delivery_gap_order(order, source=f'{source}_gate')
+        if normalized_order_status != 'pending_ship':
             logger.info(f"【{self.cookie_id}】{source} 订单不是待发货，跳过自动发货: order_id={order_id}, status={order.get('order_status')}")
             return False
         if not self.is_auto_confirm_enabled():
@@ -6189,7 +6748,56 @@ class XianyuLive:
                     # 发送发货内容
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     chat_delivered = False
-                    
+
+                    # 发货凭证直填优先（与私聊解耦）：断连/风控退避导致私聊收不到 ACK 时，
+                    # 平台发货凭证仍可通过 HTTP 完成；不适用或失败(允许回落)时走下方私聊链路
+                    trade_direct_result = await self._deliver_via_trade_text_direct(
+                        order_id=order_id, item_id=item_id, buyer_id=user_id,
+                        prepared_units=[{
+                            'unit_index': int(
+                                (delivery_result.get('delivery_unit_index') if isinstance(delivery_result, dict) else 1) or 1
+                            ),
+                            'delivery_steps': delivery_steps,
+                            'rule_meta': delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                        }],
+                        websocket=websocket, chat_id=chat_id, user_url=user_url,
+                        source='simple_auto_delivery',
+                    )
+                    if trade_direct_result:
+                        await self.send_delivery_failure_notification(
+                            send_user_name="买家",
+                            send_user_id=user_id,
+                            item_id=item_id,
+                            error_message="发货成功",
+                            chat_id=chat_id,
+                            order_id=order_id
+                        )
+                        logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 简化消息自动发货（发货凭证直填）完成')
+                        return
+                    if trade_direct_result is False and not self._is_trade_text_fallback_to_chat_enabled():
+                        self._release_data_reservation_if_needed(
+                            delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                            error='发货凭证直填失败且已关闭私聊回落',
+                        )
+                        self._record_delivery_log(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=user_id,
+                            status='failed',
+                            reason='发货凭证直填失败且已关闭私聊回落',
+                            channel='trade_text',
+                            rule_meta=delivery_rule_meta
+                        )
+                        await self.send_delivery_failure_notification(
+                            send_user_name="买家",
+                            send_user_id=user_id,
+                            item_id=item_id,
+                            error_message="发货凭证直填失败且已关闭私聊回落",
+                            chat_id=chat_id,
+                            order_id=order_id
+                        )
+                        return
+
                     try:
                         await self._send_delivery_steps(
                             websocket,
@@ -6943,6 +7551,39 @@ class XianyuLive:
 
                     send_groups = self._build_delivery_send_groups(prepared_units, quantity_to_send)
                     total_send_groups = len(send_groups)
+
+                    # 发货凭证直填优先（与私聊解耦）：整单链接+提取码一次性写进平台发货凭证。
+                    # 返回 None（不适用）或 False 且允许回落时，继续走下方私聊原子链路。
+                    if prepared_units:
+                        trade_direct_result = await self._deliver_via_trade_text_direct(
+                            order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                            buyer_nick=send_user_name, prepared_units=prepared_units,
+                            websocket=websocket, chat_id=chat_id, user_url=user_url,
+                            source='auto_delivery',
+                        )
+                        if trade_direct_result:
+                            successful_send_count = quantity_to_send
+                            send_groups = []
+                            total_send_groups = 0
+                            logger.info(
+                                f'[{msg_time}] 【{self.cookie_id}】发货凭证直填成功，跳过私聊发送循环: {order_id}'
+                            )
+                        elif trade_direct_result is False and not self._is_trade_text_fallback_to_chat_enabled():
+                            last_delivery_error = '发货凭证直填失败且已关闭私聊回落'
+                            for prepared_unit in prepared_units:
+                                unit_rule_meta = prepared_unit.get('rule_meta') or {}
+                                self._release_data_reservation_if_needed(
+                                    unit_rule_meta,
+                                    error=f"发货凭证直填失败(单元={prepared_unit.get('unit_index') or 1})"
+                                )
+                                self._record_delivery_log(
+                                    order_id=order_id, item_id=item_id,
+                                    buyer_id=send_user_id, buyer_nick=send_user_name,
+                                    status='failed', reason=last_delivery_error,
+                                    channel='trade_text', rule_meta=unit_rule_meta,
+                                )
+                            send_groups = []
+                            total_send_groups = 0
 
                     delivered_groups = []
                     any_group_send_failed = False
@@ -11349,7 +11990,14 @@ class XianyuLive:
                 next_send_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_send_time))
                 logger.info(f"Token刷新通知已发送，下次可发送时间: {next_send_time_str} (冷却时间: {cooldown_desc})")
             else:
-                logger.warning(f"【{self.cookie_id}】Token刷新通知未发送成功，不进入冷却: {notification_type}")
+                # 通知发送失败也进入冷却（降频）：通道未配置/不可达时避免每10分钟刷屏式重试
+                current_time = time.time()
+                async with self.notification_lock:
+                    self.last_notification_time[notification_key] = current_time
+                logger.warning(
+                    f"【{self.cookie_id}】Token刷新通知未发送成功，进入冷却降频({cooldown_desc})，"
+                    f"下次可发送时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time + cooldown_time))}"
+                )
 
         except Exception as e:
             logger.error(f"处理Token刷新通知失败: {self._safe_str(e)}")
@@ -11566,10 +12214,12 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送自动发货通知异常: {self._safe_str(e)}")
 
-    async def auto_confirm(self, order_id, item_id=None, retry_count=0):
+    async def auto_confirm(self, order_id, item_id=None, retry_count=0, trade_text: str = '',
+                           trade_text_max_length: int = None):
         """自动确认发货 - 使用加密模块，不包含延时处理（延时已在_auto_delivery中处理）"""
         try:
-            logger.warning(f"【{self.cookie_id}】开始确认发货，订单ID: {order_id}")
+            logger.warning(f"【{self.cookie_id}】开始确认发货，订单ID: {order_id}"
+                           + (f"（含发货凭证，长度={len(str(trade_text or ''))}）" if trade_text else ""))
 
             # 导入解密后的确认发货模块
             from secure_confirm_decrypted import SecureConfirm
@@ -11583,7 +12233,9 @@ class XianyuLive:
             secure_confirm.token_refresh_interval = self.token_refresh_interval
 
             # 调用确认方法，传入item_id用于token刷新
-            result = await secure_confirm.auto_confirm(order_id, item_id, retry_count)
+            result = await secure_confirm.auto_confirm(order_id, item_id, retry_count,
+                                                       trade_text=trade_text,
+                                                       trade_text_max_length=trade_text_max_length)
 
             # 同步更新后的cookies和token
             if secure_confirm.cookies_str != self.cookies_str:
@@ -17752,6 +18404,11 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】开始启动XianyuLive主程序...")
             await self.create_session()  # 创建session
             logger.info(f"【{self.cookie_id}】Session创建完成，开始WebSocket连接循环...")
+
+            # 履约一致性巡检：与WebSocket无关，断连/退避静默期也能发现假发货缺口并告警
+            if self._delivery_gap_patrol_task is None or self._delivery_gap_patrol_task.done():
+                self._delivery_gap_patrol_task = self._create_tracked_task(
+                    self._delivery_consistency_patrol_loop())
 
             while True:
                 try:
