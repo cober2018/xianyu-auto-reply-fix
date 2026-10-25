@@ -8,7 +8,7 @@ import os
 import random
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
 from loguru import logger
@@ -3925,10 +3925,15 @@ class XianyuLive:
         except (TypeError, ValueError):
             limit = 500
         blocks = []
+        seen_blocks = set()
         for payload in unit_payloads or []:
             body = cls.build_trade_text_body(payload, max_length=limit)
             if not body:
                 return ''
+            if body in seen_blocks:
+                # 同文本卡券多件订单：同一链接只写一次，避免凭证正文重复刷屏
+                continue
+            seen_blocks.add(body)
             blocks.append(body)
         if not blocks:
             return ''
@@ -3974,6 +3979,22 @@ class XianyuLive:
             summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
             if (summary.get('finalized_unit_indexes') or []) or (summary.get('pending_finalize_unit_indexes') or []):
                 logger.info(f"【{self.cookie_id}】{source} 订单已有在途发货单元，跳过发货凭证直填: {order_id}")
+                return None
+
+            # 原子性守卫：直填会整单 consign（平台立即 shipped），必须覆盖全部剩余单元。
+            # 多数量路径中准备失败的单元不进 prepared_units——覆盖不全时回落旧链路，绝不半发。
+            remaining_units = set(summary.get('remaining_unit_indexes') or [])
+            prepared_unit_indexes = set()
+            for prepared_unit in prepared_units:
+                try:
+                    prepared_unit_indexes.add(int(prepared_unit.get('unit_index') or 1))
+                except (TypeError, ValueError):
+                    return None
+            if not remaining_units.issubset(prepared_unit_indexes):
+                logger.info(
+                    f"【{self.cookie_id}】{source} 发货单元未全部就绪"
+                    f"({len(prepared_unit_indexes)}/{len(remaining_units)})，跳过凭证直填: {order_id}"
+                )
                 return None
 
             unit_payloads = []
@@ -4134,39 +4155,77 @@ class XianyuLive:
                 return None
             normalized = raw.replace('T', ' ')[:19]
             dt = datetime.strptime(normalized, '%Y-%m-%d %H:%M:%S')
-            return max(0.0, (datetime.now() - dt).total_seconds())
+            # 数据库全部使用 CURRENT_TIMESTAMP（UTC），必须用 UTC now 对比；
+            # 误用本地时间会把年龄虚增时区差（+8h），导致刚付款的订单被误判滞留
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            return max(0.0, (now_utc - dt).total_seconds())
         except (ValueError, TypeError):
             return None
+
+    def _is_current_live_instance(self) -> bool:
+        """代际校验：扫码热重载会创建新实例并顶替注册表，旧实例的常驻任务必须自行退出，
+        否则每次重登都会残留一个巡检循环（告警/风险日志成倍重复）。"""
+        return XianyuLive._instances.get(self.cookie_id) is self
+
+    def _prune_delivery_patrol_state(self, max_age_seconds: float = 86400.0) -> None:
+        """清理运营告警/缺口尝试冷却字典中的过期项，防止按订单ID无限增长。"""
+        cutoff = time.time() - max_age_seconds
+        for state_dict in (getattr(self, '_ops_alert_last_sent', None),
+                           getattr(self, '_delivery_gap_attempt_last', None)):
+            if not state_dict:
+                continue
+            try:
+                stale_keys = [key for key, ts in state_dict.items() if float(ts) < cutoff]
+                for key in stale_keys:
+                    state_dict.pop(key, None)
+            except Exception:
+                continue
 
     async def _delivery_consistency_patrol_loop(self):
         """履约一致性巡检主循环：与 WebSocket 连接状态无关。
 
         - 识别「平台已发货但本地无完成记录」的缺口订单（假发货事故）并告警/补写凭证；
         - 监控待发货订单滞留并告警；
-        - 登录退避静默期只做只读检测+告警，绝不发起网络请求。
+        - 登录退避静默期只做只读检测+告警，绝不发起网络请求；
+        - 启动立即首扫（尽快暴露存量缺口），此后按 delivery_gap_scan_interval 周期运行。
         """
         logger.info(f"【{self.cookie_id}】履约一致性巡检启动（假发货缺口/滞留告警）")
+        first_cycle = True
         while True:
             try:
-                interval = max(120, int(RISK_CONTROL.get('delivery_gap_scan_interval', 300) or 300))
-            except (TypeError, ValueError):
-                interval = 300
-            await self._interruptible_sleep(interval)
-            try:
-                from cookie_manager import manager as cookie_manager
-                if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
-                    logger.info(f"【{self.cookie_id}】账号已禁用，履约一致性巡检退出")
+                if not self._is_current_live_instance():
+                    logger.info(f"【{self.cookie_id}】实例已被热重载顶替，履约一致性巡检退出")
                     return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            try:
+
+                if not first_cycle:
+                    try:
+                        interval = max(120, int(RISK_CONTROL.get('delivery_gap_scan_interval', 300) or 300))
+                    except (TypeError, ValueError):
+                        interval = 300
+                    await self._interruptible_sleep(interval)
+                first_cycle = False
+
+                try:
+                    from cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，履约一致性巡检退出")
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+                if not self._is_current_live_instance():
+                    logger.info(f"【{self.cookie_id}】实例已被热重载顶替，履约一致性巡检退出")
+                    return
+
                 await self._scan_delivery_gap_orders()
+                self._prune_delivery_patrol_state()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】履约一致性巡检异常: {self._safe_str(e)}")
+                await self._interruptible_sleep(60)
 
     async def _scan_delivery_gap_orders(self, limit: int = 10) -> int:
         from db_manager import db_manager
@@ -4190,30 +4249,57 @@ class XianyuLive:
                     f"【{self.cookie_id}】履约缺口处理异常: order_id={order.get('order_id')}, {self._safe_str(e)}"
                 )
 
-        # 待发货滞留告警（只读；补发由看门狗/扫码巡检负责，这里只负责让运营方看见）
+        # 待发货滞留告警（只读；补发由看门狗/扫码巡检负责，这里只负责让运营方看见）。
+        # 滞留判定在 SQL 侧用 UTC 比较（与其余看门狗一致），避免应用层时区换算偏差。
         try:
             alert_minutes = max(5, int(RISK_CONTROL.get('delivery_gap_pending_ship_alert_minutes', 15) or 15))
-            pending_orders = await asyncio.to_thread(db_manager.get_pending_ship_orders, self.cookie_id, 10)
-            for order in pending_orders or []:
+            stale_orders = await asyncio.to_thread(
+                db_manager.get_stale_pending_ship_orders, self.cookie_id, alert_minutes, 10)
+            for order in stale_orders or []:
                 order_id = str(order.get('order_id') or '').strip()
                 if not order_id:
                     continue
-                age_seconds = self._parse_db_datetime_age_seconds(order.get('updated_at'))
-                if age_seconds is None or age_seconds < alert_minutes * 60:
-                    continue
+                # 双保险：SQL 已排除有发货状态记录的订单，这里再校验一次单元状态
                 quantity = self._get_order_expected_delivery_quantity(order_id)
                 summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
                 if summary.get('pending_finalize_unit_indexes') or summary.get('finalized_unit_indexes'):
-                    continue  # 已有在途/完成单元，链路在工作中
+                    continue
+                age_seconds = self._parse_db_datetime_age_seconds(order.get('updated_at')) \
+                    or alert_minutes * 60
+                delivery_link = self._get_stale_order_delivery_link(order)
                 await self._send_ops_alert(
                     f'pending_ship_stale:{order_id}',
                     f"⏰ 待发货订单滞留 {int(age_seconds // 60)} 分钟未发货\n"
                     f"订单: {order_id}\n买家: {order.get('buyer_nick') or order.get('buyer_id') or '-'}\n"
-                    f"商品: {order.get('item_id') or '-'}\n请检查账号在线状态与发货规则。",
+                    f"商品: {order.get('item_id') or '-'}\n"
+                    + (f"网盘链接: {delivery_link}\n" if delivery_link else '')
+                    + "请检查账号在线状态与发货规则。",
                     cooldown_seconds=7200)
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】待发货滞留告警扫描失败: {self._safe_str(e)}")
         return handled
+
+    def _get_stale_order_delivery_link(self, order) -> str:
+        """尽力而为地取滞留订单对应的网盘链接（仅唯一匹配的 text 卡券规则；只读，绝不预占卡密）。"""
+        from db_manager import db_manager
+        try:
+            item_id = str((order or {}).get('item_id') or '').strip()
+            if not item_id:
+                return ''
+            item_info = db_manager.get_item_info(self.cookie_id, item_id) or {}
+            title = str(item_info.get('item_title') or '').strip()
+            if not title:
+                return ''
+            rules = db_manager.get_delivery_rules_by_keyword(
+                title, user_id=self.user_id, only_non_multi_spec=True) or []
+            if len(rules) != 1:
+                return ''  # 零条/多条匹配：链接不确定，宁缺毋滥
+            rule = rules[0]
+            if rule.get('card_type') != 'text':
+                return ''
+            return self.extract_first_url(rule.get('text_content') or '')
+        except Exception:
+            return ''
 
     async def _handle_delivery_gap_order(self, order, source: str = 'delivery_gap_patrol') -> bool:
         """平台已发货（shipped）但本地无 finalized 的缺口订单处理。
@@ -4235,6 +4321,40 @@ class XianyuLive:
         summary = self._summarize_delivery_progress(order_id, expected_quantity=quantity) or {}
         if summary.get('finalized_unit_indexes'):
             return False  # 有完成记录，非缺口
+
+        sent_units = list(summary.get('pending_finalize_unit_indexes') or [])
+
+        # 缺口风险日志按订单去重：未结案的旧记录直接复用，避免每个巡检周期刷一行
+        gap_log_id = None
+        try:
+            existing_gap_log = db_manager.get_latest_delivery_gap_risk_log(self.cookie_id, order_id)
+            gap_log_id = (existing_gap_log or {}).get('id')
+        except Exception:
+            gap_log_id = None
+        if not gap_log_id:
+            try:
+                gap_log_id = db_manager.add_risk_control_log(
+                    cookie_id=self.cookie_id,
+                    event_type='delivery_gap',
+                    event_description=(
+                        f"平台已发货但本地无完成记录: order_id={order_id}, "
+                        f"buyer={buyer_nick or buyer_id or '-'}, sent_units={sent_units}"
+                    ),
+                    trigger_scene=source,
+                    processing_status='processing',
+                )
+            except Exception as log_error:
+                logger.warning(f"【{self.cookie_id}】履约缺口风险日志写入失败: {order_id}, {self._safe_str(log_error)}")
+                gap_log_id = None
+
+        def _resolve_gap_log(result_text: str, status: str = 'success'):
+            if not gap_log_id:
+                return
+            try:
+                db_manager.update_risk_control_log(
+                    gap_log_id, processing_status=status, processing_result=str(result_text)[:200])
+            except Exception:
+                pass
 
         # 运营方已在控制台手动补发过（channel='manual' + status='success'）→ 直接结案，
         # 不再反复告警/补写；闲鱼App内人工发消息无日志，此检查覆盖不到
@@ -4259,27 +4379,13 @@ class XianyuLive:
                     status='success', reason=f'{source} 履约缺口结案：检测到人工补发成功记录',
                     channel='manual_confirm',
                 )
+                _resolve_gap_log('检测到人工补发成功记录，缺口结案')
                 return True
         except Exception as manual_check_error:
             logger.warning(
                 f"【{self.cookie_id}】{source} 人工补发记录检查失败（继续按缺口处理）: "
                 f"order_id={order_id}, {self._safe_str(manual_check_error)}"
             )
-
-        sent_units = list(summary.get('pending_finalize_unit_indexes') or [])
-        try:
-            db_manager.add_risk_control_log(
-                cookie_id=self.cookie_id,
-                event_type='delivery_gap',
-                event_description=(
-                    f"平台已发货但本地无完成记录: order_id={order_id}, "
-                    f"buyer={buyer_nick or buyer_id or '-'}, sent_units={sent_units}"
-                ),
-                trigger_scene=source,
-                processing_status='processing',
-            )
-        except Exception as log_error:
-            logger.warning(f"【{self.cookie_id}】履约缺口风险日志写入失败: {order_id}, {self._safe_str(log_error)}")
 
         sent_payloads = []
         links_hint = []
@@ -4298,6 +4404,7 @@ class XianyuLive:
         attempt_key = f'delivery_gap_attempt:{order_id}'
 
         if (auto_retry and not in_backoff and sent_payloads
+                and self.is_auto_confirm_enabled()
                 and order_id not in self.confirmed_orders
                 and time.time() - self._delivery_gap_attempt_last.get(attempt_key, 0.0) >= 1800):
             trade_text = self.build_order_trade_text(sent_payloads, max_length=self._get_trade_text_max_length())
@@ -4329,6 +4436,7 @@ class XianyuLive:
                         status='success', reason=f'{source} 缺口订单补写发货凭证成功（平台凭证已含链接）',
                         channel=source,
                     )
+                    _resolve_gap_log('补写发货凭证成功，缺口自愈')
                     await self._send_ops_alert(
                         f'delivery_gap:{order_id}',
                         f"✅ 履约缺口已自愈: 订单 {order_id} 平台发货凭证补写成功，买家可在订单详情页查看链接。",
@@ -4343,6 +4451,7 @@ class XianyuLive:
                     or 'ORDER_ALREADY_DELIVERY' in error_text
                 )
                 if order_status_error:
+                    _resolve_gap_log('平台不允许补写发货凭证，已升级人工处理', status='processing')
                     await self._send_ops_alert(
                         f'delivery_gap:{order_id}',
                         f"⚠️ 履约缺口需人工处理: 订单 {order_id} 平台已发货且不允许补写发货凭证"
@@ -4353,12 +4462,14 @@ class XianyuLive:
                     return False
                 logger.warning(f"【{self.cookie_id}】{source} 缺口订单补写发货凭证失败: {order_id}, {error_text}")
 
+        # 无已送达内容 = 无自动恢复手段（只能人工），告警冷却放长到12小时防噪音；
+        # 有已送达内容（可自动补写重试）保持2小时
         await self._send_ops_alert(
             f'delivery_gap:{order_id}',
             f"⚠️ 履约缺口: 平台已发货但本地无完成记录，买家可能未收到内容\n"
             f"订单: {order_id}\n买家: {buyer_nick or buyer_id or '-'}\n商品: {item_id or '-'}\n"
             f"{'链接: ' + '、'.join(links_hint) if links_hint else '（本地无已送达内容，请从卡券记录人工核实补发，切勿盲目重发）'}",
-            cooldown_seconds=7200)
+            cooldown_seconds=43200 if not sent_payloads else 7200)
         return False
 
 
@@ -18839,7 +18950,19 @@ class XianyuLive:
         finally:
             # 更新连接状态为已关闭
             self._set_connection_state(ConnectionState.CLOSED, "程序退出")
-            
+
+            # 履约一致性巡检与WS无关、不在具名后台任务清理范围，主循环退出时必须显式取消，
+            # 否则扫码热重载后会残留多个巡检循环（告警/风险日志成倍重复）
+            patrol_task = getattr(self, '_delivery_gap_patrol_task', None)
+            if patrol_task and not patrol_task.done():
+                try:
+                    patrol_task.cancel()
+                    logger.info(f"【{self.cookie_id}】履约一致性巡检任务已随主循环退出而取消")
+                except Exception as patrol_cancel_error:
+                    logger.warning(f"【{self.cookie_id}】取消履约一致性巡检任务失败: {self._safe_str(patrol_cancel_error)}")
+                finally:
+                    self._delivery_gap_patrol_task = None
+
             # 清空当前token
             if self.current_token:
                 logger.info(f"【{self.cookie_id}】程序退出，清空当前token")

@@ -5574,6 +5574,76 @@ Cookie数量: {cookie_count}
             'states': states,
         }
 
+    def get_stale_pending_ship_orders(self, cookie_id: str, older_than_minutes: int = 15, limit: int = 10) -> list:
+        """获取滞留超过指定分钟数、完全没有任何发货状态记录的待发货订单（履约巡检滞留告警用）。
+
+        滞留判定在 SQL 侧用 UTC 时间比较（与其余看门狗一致），避免应用层时区换算偏差。
+        只读，不回填。
+        """
+        if not cookie_id:
+            return []
+        safe_minutes = max(5, int(older_than_minutes or 15))
+        safe_limit = max(1, min(int(limit or 10), 100))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT o.order_id, o.item_id, o.buyer_id, o.buyer_nick, o.sid, o.order_status, o.updated_at
+                    FROM orders o
+                    WHERE o.cookie_id = ?
+                      AND o.order_status IN ('pending_ship', 'pending_delivery')
+                      AND datetime(o.updated_at) <= datetime('now', ?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_finalization_states s
+                          WHERE s.order_id = o.order_id
+                      )
+                    ORDER BY datetime(o.updated_at) ASC
+                    LIMIT ?
+                    ''',
+                    (cookie_id, f'-{safe_minutes} minutes', safe_limit)
+                )
+                return [
+                    {
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': row[3],
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'updated_at': row[6],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"查询滞留待发货订单失败: cookie_id={cookie_id} - {e}")
+                return []
+
+    def get_latest_delivery_gap_risk_log(self, cookie_id: str, order_id: str):
+        """获取该订单最近一条履约缺口风险日志（delivery_gap 巡检去重与结案回写用）。"""
+        if not cookie_id or not order_id:
+            return None
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT id, processing_status FROM risk_control_logs
+                    WHERE cookie_id = ? AND event_type = 'delivery_gap'
+                      AND event_description LIKE ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    ''',
+                    (cookie_id, f'%order_id={order_id}%')
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {'id': row[0], 'processing_status': row[1]}
+            except Exception as e:
+                logger.error(f"查询履约缺口风险日志失败: order_id={order_id} - {e}")
+                return None
+
     def has_manual_delivery_success(self, order_id: str) -> bool:
         """该订单是否存在「手动发货成功」记录（运营方在控制台人工补发过的证据）。
 

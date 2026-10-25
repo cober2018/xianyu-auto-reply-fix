@@ -10,9 +10,12 @@
 """
 import asyncio
 import json
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+import db_manager as dbm
 import XianyuAutoAsync
 from XianyuAutoAsync import XianyuLive
 
@@ -209,8 +212,10 @@ class TradeTextBuilderTests(unittest.TestCase):
 
     def test_order_level_requires_all_units_extractable(self):
         ok = 'https://pan.baidu.com/s/a1 提取码: 1111'
-        self.assertEqual(XianyuLive.build_order_trade_text([ok, ok]).count('https://'), 2)
+        self.assertEqual(XianyuLive.build_order_trade_text([ok, ok]).count('https://'), 1)  # 同卡券去重
         self.assertEqual(XianyuLive.build_order_trade_text([ok, '纯文本卡密']), '')
+        other = 'https://pan.baidu.com/s/a2 提取码: 2222'
+        self.assertEqual(XianyuLive.build_order_trade_text([ok, other]).count('https://'), 2)  # 不同链接都保留
 
     def test_instance_builder_disabled_by_config(self):
         live = _direct_live('cfg-unit')
@@ -338,6 +343,17 @@ class GapHandlerTests(unittest.TestCase):
     ORDER = {'order_id': 'poG', 'item_id': 'itG', 'buyer_id': 'bG', 'buyer_nick': '买家G',
              'sid': 'sidG@goofish', 'order_status': 'shipped', 'updated_at': '2026-10-25 12:00:00'}
 
+    def setUp(self):
+        # 缺口处理器直连 db_manager 单例：统一挡住风险日志读写，避免污染真实库并保证确定性
+        for target, ret in (
+            ('add_risk_control_log', None),
+            ('get_latest_delivery_gap_risk_log', None),
+            ('update_risk_control_log', True),
+        ):
+            patcher = mock.patch.object(dbm.db_manager, target, return_value=ret)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _gap_live(self, sent_units=(), sent_metas=None):
         live = _direct_live('gap-unit')
         live._get_order_expected_delivery_quantity = lambda order_id: 2
@@ -420,6 +436,46 @@ class GapHandlerTests(unittest.TestCase):
         self.assertEqual(statuses, ['finalized', 'finalized'])
         channels = [c.kwargs.get('channel') for c in live._persist_delivery_finalization_state.call_args_list]
         self.assertTrue(all(ch == 'manual_confirm' for ch in channels))
+
+    def test_risk_log_dedup_and_resolve_on_success(self):
+        """中-3：已有未结案缺口日志时不再重复写入；自愈后回写 success。"""
+        live = self._gap_live(sent_units=[1, 2])
+        with mock.patch.object(dbm.db_manager, 'get_latest_delivery_gap_risk_log',
+                               return_value={'id': 55, 'processing_status': 'processing'}), \
+                mock.patch.object(dbm.db_manager, 'add_risk_control_log',
+                                  side_effect=AssertionError('不应重复写入')) as add_log, \
+                mock.patch.object(dbm.db_manager, 'update_risk_control_log',
+                                  return_value=True) as update_log:
+            result = asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+
+        self.assertTrue(result)
+        add_log.assert_not_called()
+        update_log.assert_any_call(55, processing_status='success', processing_result=mock.ANY)
+
+    def test_no_recovery_gap_alert_uses_12h_cooldown(self):
+        """无已送达内容=无自动恢复手段，末次告警冷却12小时防噪音。"""
+        live = self._gap_live(sent_units=[])
+        live._get_pending_delivery_finalization_meta = lambda order_id, unit: None
+
+        asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+        self.assertEqual(live._send_ops_alert.call_args.kwargs.get('cooldown_seconds'), 43200)
+
+    def test_recoverable_gap_alert_keeps_2h_cooldown(self):
+        live = self._gap_live(sent_units=[1, 2])
+        live.auto_confirm = mock.AsyncMock(return_value={'error': 'SYSTEM_ERROR::系统繁忙，请稍后再试'})
+
+        asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+        self.assertEqual(live._send_ops_alert.call_args.kwargs.get('cooldown_seconds'), 7200)
+
+    def test_auto_confirm_disabled_skips_rewrite(self):
+        """低-1：账号关闭自动确认时，缺口处理器不得调用平台确认接口。"""
+        live = self._gap_live(sent_units=[1, 2])
+        live.is_auto_confirm_enabled = lambda: False
+
+        result = asyncio.run(live._handle_delivery_gap_order(dict(self.ORDER), source='gap_test'))
+        self.assertFalse(result)
+        live.auto_confirm.assert_not_awaited()
+        live._send_ops_alert.assert_awaited_once()
 
     def test_no_manual_record_still_alerts(self):
         import db_manager as dbm
@@ -561,22 +617,99 @@ class GapScanTests(unittest.TestCase):
         handler.assert_awaited_once()
 
     def test_scan_pending_stale_alert(self):
-        import datetime as _dt
-        import db_manager as dbm
         live = _direct_live('scan-unit')
-        stale_time = (_dt.datetime.now() - _dt.timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
-        pending = [{'order_id': 'poP', 'item_id': 'itP', 'buyer_id': 'bP', 'buyer_nick': '买家P',
-                    'sid': 's', 'order_status': 'pending_ship', 'updated_at': stale_time}]
+        stale_time = (datetime.now() - timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
+        stale = [{'order_id': 'poP', 'item_id': 'itP', 'buyer_id': 'bP', 'buyer_nick': '买家P',
+                  'sid': 's', 'order_status': 'pending_ship', 'updated_at': stale_time}]
         alert = mock.AsyncMock(return_value=True)
         live._send_ops_alert = alert
+        live._get_stale_order_delivery_link = lambda order: ''
 
         with mock.patch.object(dbm.db_manager, 'get_shipped_orders_without_finalization',
                                return_value=[]), \
-                mock.patch.object(dbm.db_manager, 'get_pending_ship_orders', return_value=pending):
+                mock.patch.object(dbm.db_manager, 'get_stale_pending_ship_orders', return_value=stale):
             asyncio.run(live._scan_delivery_gap_orders())
 
         alert.assert_awaited_once()
         self.assertTrue(alert.call_args.args[0].startswith('pending_ship_stale:poP'))
+
+
+    def test_partial_prepared_units_skip_direct(self):
+        """中-2 原子性守卫：多数量路径部分单元准备失败时，直填绝不整单 consign。"""
+        live = _direct_live()
+        live._get_order_expected_delivery_quantity = lambda order_id: 3
+
+        async def run():
+            return await live._deliver_via_trade_text_direct(
+                order_id='po1', item_id='it1', buyer_id='b1',
+                prepared_units=[_prepared_unit('https://pan.baidu.com/s/a1', 1),
+                                _prepared_unit('https://pan.baidu.com/s/a3', 3)],
+                source='test')
+
+        self.assertIsNone(asyncio.run(run()))
+        live.auto_confirm.assert_not_awaited()
+
+
+class TimezoneTests(unittest.TestCase):
+    def test_db_age_uses_utc_not_local(self):
+        """高-1：库内时间戳为UTC，年龄计算必须用UTC，否则新订单被误判滞留8小时。"""
+        utc_16min_ago = (datetime.now(timezone.utc) - timedelta(minutes=16)).strftime('%Y-%m-%d %H:%M:%S')
+        age = XianyuLive._parse_db_datetime_age_seconds(utc_16min_ago)
+        self.assertIsNotNone(age)
+        self.assertTrue(900 <= age <= 1100, f'age={age}')
+        # 本地时间字符串（比UTC快8小时）解析为负年龄 → 钳为0，不再虚增
+        local_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.assertEqual(XianyuLive._parse_db_datetime_age_seconds(local_now), 0.0)
+        self.assertIsNone(XianyuLive._parse_db_datetime_age_seconds(''))
+        self.assertIsNone(XianyuLive._parse_db_datetime_age_seconds(None))
+
+
+class GenerationTests(unittest.TestCase):
+    def tearDown(self):
+        XianyuLive._instances.pop('gen-unit', None)
+
+    def test_patrol_generation_check(self):
+        live = _direct_live('gen-unit')
+        self.assertFalse(live._is_current_live_instance())  # 未注册（测试实例）
+        XianyuLive._instances['gen-unit'] = live
+        self.assertTrue(live._is_current_live_instance())
+        XianyuLive._instances['gen-unit'] = object()  # 被热重载新实例顶替
+        self.assertFalse(live._is_current_live_instance())
+
+
+class PruneTests(unittest.TestCase):
+    def test_prune_removes_expired_entries(self):
+        live = _direct_live('prune-unit')
+        live._ops_alert_last_sent = {'old': time.time() - 90000, 'fresh': time.time()}
+        live._delivery_gap_attempt_last = {'old2': 1.0}
+        live._prune_delivery_patrol_state()
+        self.assertNotIn('old', live._ops_alert_last_sent)
+        self.assertIn('fresh', live._ops_alert_last_sent)
+        self.assertNotIn('old2', live._delivery_gap_attempt_last)
+
+
+class StaleLinkTests(unittest.TestCase):
+    def test_single_text_rule_provides_link(self):
+        live = _direct_live('link-unit')
+        with mock.patch.object(dbm.db_manager, 'get_item_info',
+                               return_value={'item_title': '测试商品'}), \
+                mock.patch.object(dbm.db_manager, 'get_delivery_rules_by_keyword',
+                                  return_value=[{'card_type': 'text',
+                                                 'text_content': 'https://pan.baidu.com/s/l1 提取码: ab12'}]):
+            self.assertEqual(live._get_stale_order_delivery_link({'item_id': 'it1'}),
+                             'https://pan.baidu.com/s/l1')
+
+    def test_multiple_rules_or_non_text_yield_no_link(self):
+        live = _direct_live('link-unit')
+        with mock.patch.object(dbm.db_manager, 'get_item_info', return_value={'item_title': 'T'}), \
+                mock.patch.object(dbm.db_manager, 'get_delivery_rules_by_keyword',
+                                  return_value=[{'card_type': 'text', 'text_content': 'x'},
+                                                {'card_type': 'text', 'text_content': 'y'}]):
+            self.assertEqual(live._get_stale_order_delivery_link({'item_id': 'it1'}), '')
+        with mock.patch.object(dbm.db_manager, 'get_item_info', return_value={'item_title': 'T'}), \
+                mock.patch.object(dbm.db_manager, 'get_delivery_rules_by_keyword',
+                                  return_value=[{'card_type': 'data', 'card_id': 9}]):
+            self.assertEqual(live._get_stale_order_delivery_link({'item_id': 'it1'}), '')
 
 
 if __name__ == '__main__':
