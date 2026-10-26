@@ -74,6 +74,7 @@ def _gap_live(cookie_id='dual-gap'):
     live._ops_alert_last_sent = {}
     live._delivery_gap_attempt_last = {}
     live._last_orders_recovery_sync_time = 0.0
+    live._chat_gap_resend_inflight = set()
     live.user_id = 1
     live.ws = None
     live._record_delivery_log = mock.MagicMock()
@@ -185,6 +186,8 @@ class ChatGapHandlerTests(unittest.TestCase):
         alert_text = live._send_ops_alert.call_args.args[1]
         self.assertIn('已自动重试 1/3', alert_text)
         self.assertIn('回执超时', alert_text)
+        # BUG-4：发送结束后 in-flight 守卫必须释放，不阻塞后续重试
+        self.assertEqual(live._chat_gap_resend_inflight, set())
 
     def test_max_attempts_stops_retry_and_requires_manual(self):
         """B5：达到次数上限 → 不再发送，转人工告警。"""
@@ -230,6 +233,58 @@ class ChatGapHandlerTests(unittest.TestCase):
         live._send_delivery_steps.assert_not_awaited()
         manual = [u for u in self._states_after() if u['status'] == 'manual_delivered']
         self.assertEqual(len(manual), 1)
+
+    def test_manual_close_resolves_risk_log_and_backfills_units(self):
+        """BUG-1/2 修复：人工结案回写已建风险日志；无 chat 行的存量单按 trade_text 单元回填结案。"""
+        self.db_state['manual_success'] = True
+        self.db_state['gap_log'] = {'id': 55, 'processing_status': 'processing'}
+        self.db_state['channel_states'] = []  # 部署前直填的存量单：没有任何 chat 行
+        self.db_state['finalization_states'] = [
+            {'order_id': 'poG', 'unit_index': 1, 'channel': 'trade_text', 'status': 'finalized',
+             'delivery_meta': {'data_line': 'https://pan.baidu.com/s/u1 提取码: aa11'}},
+            {'order_id': 'poG', 'unit_index': 2, 'channel': 'trade_text', 'status': 'finalized',
+             'delivery_meta': {'data_line': 'https://pan.baidu.com/s/u2 提取码: bb22'}},
+        ]
+        live = _gap_live()
+        live._send_delivery_steps = mock.AsyncMock()
+
+        result = asyncio.run(live._handle_chat_notification_gap_order(dict(self.ORDER)))
+
+        self.assertTrue(result)
+        live._send_delivery_steps.assert_not_awaited()
+        manual = [u for u in self._states_after() if u['status'] == 'manual_delivered']
+        self.assertEqual(sorted(u['unit_index'] for u in manual), [1, 2])
+        # BUG-1：已建缺口风险日志必须结案回写，否则风控面板残留 processing
+        self.assertEqual(dbm.db_manager.update_risk_control_log.call_args.args[0], 55)
+        self.assertEqual(dbm.db_manager.update_risk_control_log.call_args.kwargs.get('processing_status'), 'success')
+
+    def test_missing_sid_requires_manual_without_burning_attempt(self):
+        """BUG-6 修复：巡检自动补发要求 sid；缺 sid 转人工，不烧补发计次。"""
+        order = dict(self.ORDER)
+        order['sid'] = ''
+        live = _gap_live()
+        live.ws = object()
+        live._send_delivery_steps = mock.AsyncMock()
+
+        result = asyncio.run(live._handle_chat_notification_gap_order(order))
+
+        self.assertFalse(result)
+        live._send_delivery_steps.assert_not_awaited()
+        self.assertIn('会话ID', live._send_ops_alert.call_args.args[1])
+        self.assertEqual([u for u in self._states_after() if u.get('bump_attempt')], [])
+
+    def test_concurrent_resend_guard_skips_duplicate_send(self):
+        """BUG-4 修复：in-flight 期间重复触发（巡检与控制台并发）只允许一路发送。"""
+        live = _gap_live()
+        live.ws = object()
+        live._send_delivery_steps = mock.AsyncMock()
+        live._chat_gap_resend_inflight = {'poG'}  # 另一路补发正在进行
+
+        result = asyncio.run(live._handle_chat_notification_gap_order(dict(self.ORDER)))
+
+        self.assertFalse(result)
+        live._send_delivery_steps.assert_not_awaited()
+        self.assertEqual(self._states_after(), [])
 
     def test_login_backoff_silence_no_network(self):
         """退避静默期：不发任何网络请求，只告警。"""
@@ -366,6 +421,26 @@ class DirectChannelBookkeepingTests(unittest.TestCase):
         self.assertFalse(asyncio.run(run()))
         live._record_chat_channel_state.assert_not_called()
         live._send_ops_alert.assert_not_awaited()
+
+    def test_a2_alert_contains_order_time_and_age(self):
+        """遗漏-3 修复：直填即时告警也带下单时间与滞留时长（2.6 全要素）。"""
+        live = _direct_live()
+        live._send_delivery_steps = mock.AsyncMock(side_effect=RuntimeError('回执超时'))
+        recent_utc = datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+
+        async def run():
+            return await live._deliver_via_trade_text_direct(
+                order_id='po1', item_id='it1', buyer_id='b1',
+                prepared_units=[_prepared_unit('https://pan.baidu.com/s/a1 提取码: 8k2p')],
+                websocket=object(), chat_id='cid1', source='test')
+
+        with mock.patch.object(dbm.db_manager, 'get_order_by_id',
+                               return_value={'order_id': 'po1', 'created_at': recent_utc}):
+            self.assertTrue(asyncio.run(run()))
+        alert_text = live._send_ops_alert.call_args.args[1]
+        self.assertIn('下单时间', alert_text)
+        self.assertIn('滞留', alert_text)
+        self.assertTrue('分钟' in alert_text or '小时' in alert_text)
 
     def test_chat_gap_alert_message_contains_all_required_fields(self):
         """2.6：告警正文含订单/买家/滞留/通道/可见内容/重试计划/人工指引。"""
@@ -514,6 +589,38 @@ class ChannelStoreSqlTests(unittest.TestCase):
         matched = {r['order_id'] for r in self.store.get_chat_notification_gap_orders('cookie-x', 72, 10)}
         self.assertNotIn('poOld', matched)
 
+    def test_partial_unit_gap_still_matched(self):
+        """BUG-3 修复：多单元订单部分单元私信未送达仍命中，不被「任一单元已送达」整体排除。"""
+        self._seed_order('poPart')
+        self._seed_order('poAll')
+        for order_id in ('poPart', 'poAll'):
+            for unit in (1, 2):
+                self.store.upsert_delivery_finalization_state(order_id, unit, 'cookie-x', 'it', 'b',
+                                                              channel='trade_text', status='finalized')
+        # poPart：单元1已送达、单元2未送达 → 必须命中；poAll：两单元都送达 → 不命中
+        self.store.upsert_delivery_channel_state('poPart', 1, 'chat', 'delivered')
+        self.store.upsert_delivery_channel_state('poPart', 2, 'chat', 'pending')
+        self.store.upsert_delivery_channel_state('poAll', 1, 'chat', 'delivered')
+        self.store.upsert_delivery_channel_state('poAll', 2, 'chat', 'delivered')
+
+        matched = {r['order_id'] for r in self.store.get_chat_notification_gap_orders('cookie-x', 72, 10)}
+        self.assertIn('poPart', matched)
+        self.assertNotIn('poAll', matched)
+
+    def test_bulk_view_queries_group_by_order(self):
+        """C3 批量查询：按账号一次取回，按订单分组。"""
+        self._seed_order('poBulk1')
+        self._seed_order('poBulk2')
+        self.store.upsert_delivery_finalization_state('poBulk1', 1, 'cookie-x', 'it', 'b',
+                                                      channel='trade_text', status='finalized')
+        self.store.upsert_delivery_finalization_state('poBulk1', 2, 'cookie-x', 'it', 'b',
+                                                      channel='trade_text', status='sent')
+        self.store.upsert_delivery_channel_state('poBulk1', 1, 'chat', 'delivered', cookie_id='cookie-x')
+        trade_map = self.store.get_trade_text_delivery_units_by_cookie(['cookie-x'])
+        self.assertEqual(sorted(trade_map.get('poBulk1')), [1, 2])
+        chat_map = self.store.get_chat_channel_states_by_cookie(['cookie-x'])
+        self.assertEqual(chat_map.get('poBulk1'), [{'unit_index': 1, 'status': 'delivered'}])
+
 
 class RecoverySyncTests(unittest.TestCase):
     """2.8：掉线恢复在线后的一次性订单补拉调度。"""
@@ -637,6 +744,21 @@ class ReplyServerChatResendTests(unittest.TestCase):
         self.assertEqual(len(bumped), 1)
         self.assertIn('ack 超时', bumped[0]['last_error'])
 
+    def test_resend_skips_when_auto_resend_inflight(self):
+        """BUG-4 修复（控制台侧）：巡检自动补发进行中时，手动补发入口拒绝重复发送。"""
+        live = self._resend_live()
+        live.ws = object()
+        live._chat_gap_resend_inflight = {'poR'}
+        live._send_delivery_steps = mock.AsyncMock()
+
+        result = asyncio.run(self.rs._resend_order_chat_notification_snapshot(
+            live, dict(self.ORDER), 'cookie-x', {'user_id': 1, 'username': 'ops'}))
+
+        self.assertFalse(result['success'])
+        self.assertIn('自动补发中', result['message'])
+        live._send_delivery_steps.assert_not_awaited()
+        self.assertEqual([u for u in self.upserts if u['status'] == 'delivered'], [])
+
     def test_manual_mark_endpoint_closes_gap_without_sending(self):
         import asyncio as _asyncio
 
@@ -651,6 +773,45 @@ class ReplyServerChatResendTests(unittest.TestCase):
         manual = [u for u in self.upserts if u['status'] == 'manual_delivered']
         self.assertEqual(len(manual), 1)
         self.assertEqual(self.rs.db_manager.update_risk_control_log.call_count, 1)
+
+
+class FulfillmentViewTests(unittest.TestCase):
+    """C3：订单列表的双通道履约完整度派生视图。"""
+
+    def test_complete_and_incomplete_orders(self):
+        import reply_server
+        orders = [
+            {'order_id': 'poF1'},  # 双通道齐（含人工结案）→ complete
+            {'order_id': 'poF2'},  # 单元2私信未送达 → 不完整
+            {'order_id': 'poF3'},  # 无直填证据 → 不携带字段（旧单通道订单）
+        ]
+        trade_map = {'poF1': [1, 2], 'poF2': [1, 2]}
+        chat_map = {
+            'poF1': [{'unit_index': 1, 'status': 'delivered'},
+                     {'unit_index': 2, 'status': 'manual_delivered'}],
+            'poF2': [{'unit_index': 1, 'status': 'delivered'},
+                     {'unit_index': 2, 'status': 'pending'}],
+        }
+        with mock.patch.object(dbm.db_manager, 'get_trade_text_delivery_units_by_cookie',
+                               return_value=trade_map), \
+                mock.patch.object(dbm.db_manager, 'get_chat_channel_states_by_cookie',
+                                  return_value=chat_map):
+            reply_server._attach_order_fulfillment_views(orders, ['cookie-x'])
+
+        self.assertTrue(orders[0]['fulfillment']['complete'])
+        self.assertEqual(orders[0]['fulfillment']['chat']['delivered_units'], [1, 2])
+        self.assertEqual(orders[0]['fulfillment']['chat']['pending_units'], [])
+        self.assertFalse(orders[1]['fulfillment']['complete'])
+        self.assertEqual(orders[1]['fulfillment']['chat']['pending_units'], [2])
+        self.assertNotIn('fulfillment', orders[2])
+
+    def test_db_error_leaves_orders_untouched(self):
+        import reply_server
+        orders = [{'order_id': 'poF9'}]
+        with mock.patch.object(dbm.db_manager, 'get_trade_text_delivery_units_by_cookie',
+                               side_effect=RuntimeError('db down')):
+            reply_server._attach_order_fulfillment_views(orders, ['cookie-x'])
+        self.assertNotIn('fulfillment', orders[0])
 
 
 if __name__ == '__main__':

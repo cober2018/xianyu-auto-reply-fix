@@ -12885,6 +12885,39 @@ async def recover_order_by_id(request: OrderRecoverRequest, current_user: Dict[s
         raise HTTPException(status_code=500, detail=f"按订单ID补抓失败: {exc}")
 
 
+def _attach_order_fulfillment_views(orders: list, cookie_ids: list) -> None:
+    """为订单列表附加双通道履约完整度派生视图（C3，只读）。
+
+    「履约完整 = 凭证直填送达的每个发货单元，其私信通道都已送达或人工结案」。
+    只给有直填送达证据的订单携带该字段（旧单通道订单不携带，避免误导）。
+    两条按账号的批量查询 + 内存派生，不逐单查库。
+    """
+    try:
+        trade_units_map = db_manager.get_trade_text_delivery_units_by_cookie(list(cookie_ids or []))
+        chat_states_map = db_manager.get_chat_channel_states_by_cookie(list(cookie_ids or []))
+    except Exception as fulfillment_error:
+        logger.warning(f"构建订单双通道履约视图失败: {fulfillment_error}")
+        return
+    for order in orders or []:
+        order_id = str(order.get('order_id') or '')
+        trade_units = set(trade_units_map.get(order_id) or [])
+        if not trade_units:
+            continue
+        chat_states = chat_states_map.get(order_id) or []
+        chat_delivered = {s['unit_index'] for s in chat_states
+                          if s.get('status') in ('delivered', 'manual_delivered')}
+        chat_pending = ({s['unit_index'] for s in chat_states
+                         if s.get('status') in ('pending', 'failed')} - chat_delivered) & trade_units
+        order['fulfillment'] = {
+            'trade_text': {'delivered_units': sorted(trade_units)},
+            'chat': {
+                'delivered_units': sorted(chat_delivered & trade_units),
+                'pending_units': sorted(chat_pending),
+            },
+            'complete': trade_units.issubset(chat_delivered),
+        }
+
+
 @app.get('/api/orders')
 def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的订单信息"""
@@ -12921,6 +12954,9 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
                         order['pending_confirm_units'] = len(pending_states)
                         order['pending_confirm_error'] = '；'.join(pending_errors[:3]) if pending_errors else '平台确认发货失败，等待补确认'
                 all_orders.append(order)
+
+        # 双通道履约完整度派生视图（C3）：凭证直填订单携带 fulfillment 字段，只读
+        _attach_order_fulfillment_views(all_orders, list(user_cookies.keys()))
 
         # 历史订单补录后优先按平台下单时间展示，回退到本地入库时间
         all_orders.sort(
@@ -14384,40 +14420,52 @@ async def _resend_order_chat_notification_snapshot(xianyu_instance, order: dict,
                 "message": ("长连接未就绪，暂无法补发私信；可在长连接恢复后重试，"
                             f"或调 POST /api/orders/{order_id}/chat-notification/manual-mark 标记已人工送达")}
 
+    # 并发守卫：巡检自动补发可能正在进行（共用实例级 in-flight 集合），防止买家收到重复消息
+    inflight = getattr(xianyu_instance, '_chat_gap_resend_inflight', None)
+    if inflight is None:
+        inflight = set()
+        xianyu_instance._chat_gap_resend_inflight = inflight
+    if order_id in inflight:
+        return {"success": False, "delivered": True,
+                "message": "该订单私信正在自动补发中，请稍后刷新订单确认结果，无需重复操作"}
+    inflight.add(order_id)
     try:
-        await xianyu_instance._send_delivery_steps(
-            ws, chat_id, buyer_id, steps,
-            log_prefix=f'手动补发私信通知 order_id={order_id}')
-    except Exception as send_error:
-        reason = str(send_error)
+        try:
+            await xianyu_instance._send_delivery_steps(
+                ws, chat_id, buyer_id, steps,
+                log_prefix=f'手动补发私信通知 order_id={order_id}')
+        except Exception as send_error:
+            reason = str(send_error)
+            for state in used_units:
+                db_manager.upsert_delivery_channel_state(
+                    order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
+                    status='pending', last_error=f'手动补发失败: {reason}', bump_attempt=True,
+                    cookie_id=cookie_id, item_id=item_id, buyer_id=buyer_id)
+            db_manager.create_delivery_log(
+                user_id=current_user['user_id'], cookie_id=cookie_id, order_id=order_id,
+                item_id=item_id, buyer_id=buyer_id, buyer_nick=order.get('buyer_nick'),
+                channel='chat', status='failed',
+                reason=f'控制台手动补发私信失败: {reason}')
+            return {"success": False, "delivered": True,
+                    "message": f"私信补发失败: {reason}（已记录，长连接恢复后可重试）"}
+
         for state in used_units:
             db_manager.upsert_delivery_channel_state(
                 order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
-                status='pending', last_error=f'手动补发失败: {reason}', bump_attempt=True,
+                status='delivered', last_error='',
                 cookie_id=cookie_id, item_id=item_id, buyer_id=buyer_id)
         db_manager.create_delivery_log(
             user_id=current_user['user_id'], cookie_id=cookie_id, order_id=order_id,
             item_id=item_id, buyer_id=buyer_id, buyer_nick=order.get('buyer_nick'),
-            channel='chat', status='failed',
-            reason=f'控制台手动补发私信失败: {reason}')
-        return {"success": False, "delivered": True,
-                "message": f"私信补发失败: {reason}（已记录，长连接恢复后可重试）"}
-
-    for state in used_units:
-        db_manager.upsert_delivery_channel_state(
-            order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
-            status='delivered', last_error='',
-            cookie_id=cookie_id, item_id=item_id, buyer_id=buyer_id)
-    db_manager.create_delivery_log(
-        user_id=current_user['user_id'], cookie_id=cookie_id, order_id=order_id,
-        item_id=item_id, buyer_id=buyer_id, buyer_nick=order.get('buyer_nick'),
-        channel='chat', status='success',
-        reason='控制台手动补发私信成功（原样快照，双通道履约完整）')
-    _resolve_chat_gap_risk_log(cookie_id, order_id, '控制台手动补发私信成功，缺口结案')
-    publish_order_update_event(order_id, source='manual_chat_resend')
-    log_with_user('info', f"手动发货: 订单 {order_id} 私信通知已原样补发（双通道履约完整）", current_user)
-    return {"success": True, "delivered": True, "channel": "chat",
-            "message": "发货单元已全部完成；检测到私信通知未送达，已原样补发私信并结案缺口"}
+            channel='chat', status='success',
+            reason='控制台手动补发私信成功（原样快照，双通道履约完整）')
+        _resolve_chat_gap_risk_log(cookie_id, order_id, '控制台手动补发私信成功，缺口结案')
+        publish_order_update_event(order_id, source='manual_chat_resend')
+        log_with_user('info', f"手动发货: 订单 {order_id} 私信通知已原样补发（双通道履约完整）", current_user)
+        return {"success": True, "delivered": True, "channel": "chat",
+                "message": "发货单元已全部完成；检测到私信通知未送达，已原样补发私信并结案缺口"}
+    finally:
+        inflight.discard(order_id)
 
 
 @app.post('/api/orders/{order_id}/deliver')

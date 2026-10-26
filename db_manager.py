@@ -5795,9 +5795,9 @@ Cookie数量: {cookie_count}
     def get_chat_notification_gap_orders(self, cookie_id: str, within_hours: int = 72, limit: int = 10) -> list:
         """扫描「发货凭证已送达、私信通知未送达」的缺口订单（私信缺口巡检用）。
 
-        判据：存在 channel='trade_text' 的完成记录（只有直填新链路会写，存量老订单天然不命中），
-        且不存在 channel='chat' 的 delivered/manual_delivered 记录。
-        时间窗按订单创建时间（UTC SQL 比较），窗口内的老缺口（如直填成功但当时无通道行）也会被捞回。
+        逐单元判定：存在某个 trade_text 完成单元，其对应 chat 通道单元未送达（pending/failed 或无行）
+        即为缺口——多单元订单部分单元私信未送达也会命中，不会被"任一单元已送达"整体排除。
+        时间窗按订单创建时间（UTC SQL 比较）；无任何 chat 行的部署前直填存量单也会被捞回（回填用）。
         只读，不回填。
         """
         if not cookie_id:
@@ -5820,11 +5820,12 @@ Cookie数量: {cookie_count}
                       AND EXISTS (
                           SELECT 1 FROM delivery_finalization_states f
                           WHERE f.order_id = o.order_id AND f.channel = 'trade_text'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM delivery_channel_states c
-                          WHERE c.order_id = o.order_id AND c.channel = 'chat'
-                            AND c.status IN ('delivered', 'manual_delivered')
+                            AND NOT EXISTS (
+                                SELECT 1 FROM delivery_channel_states c
+                                WHERE c.order_id = o.order_id AND c.channel = 'chat'
+                                  AND c.status IN ('delivered', 'manual_delivered')
+                                  AND c.unit_index = f.unit_index
+                            )
                       )
                     ORDER BY datetime(o.created_at) ASC
                     LIMIT ?
@@ -5847,6 +5848,70 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"查询私信通知缺口订单失败: cookie_id={cookie_id} - {e}")
                 return []
+
+    def get_trade_text_delivery_units_by_cookie(self, cookie_ids: list) -> dict:
+        """按账号批量取「发货凭证直填已送达」单元索引：{order_id: [unit_index, ...]}。
+
+        订单列表双通道履约视图用（C3）——一次查询替代逐单查询。
+        """
+        results = {}
+        cookie_list = [str(c) for c in (cookie_ids or []) if c]
+        if not cookie_list:
+            return results
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                for i in range(0, len(cookie_list), 50):
+                    chunk = cookie_list[i:i + 50]
+                    placeholders = ','.join('?' * len(chunk))
+                    cursor.execute(
+                        f'''
+                        SELECT order_id, unit_index FROM delivery_finalization_states
+                        WHERE channel = 'trade_text' AND cookie_id IN ({placeholders})
+                        ''',
+                        tuple(chunk))
+                    for order_id, unit_index in cursor.fetchall():
+                        try:
+                            results.setdefault(str(order_id), []).append(int(unit_index or 1))
+                        except (TypeError, ValueError):
+                            continue
+                return results
+            except Exception as e:
+                logger.error(f"批量查询直填送达单元失败: {e}")
+                return results
+
+    def get_chat_channel_states_by_cookie(self, cookie_ids: list) -> dict:
+        """按账号批量取私信通道状态行：{order_id: [{'unit_index': int, 'status': str}, ...]}。
+
+        订单列表双通道履约视图用（C3）。
+        """
+        results = {}
+        cookie_list = [str(c) for c in (cookie_ids or []) if c]
+        if not cookie_list:
+            return results
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                for i in range(0, len(cookie_list), 50):
+                    chunk = cookie_list[i:i + 50]
+                    placeholders = ','.join('?' * len(chunk))
+                    cursor.execute(
+                        f'''
+                        SELECT order_id, unit_index, status FROM delivery_channel_states
+                        WHERE channel = 'chat' AND cookie_id IN ({placeholders})
+                        ''',
+                        tuple(chunk))
+                    for order_id, unit_index, status in cursor.fetchall():
+                        try:
+                            unit = int(unit_index or 1)
+                        except (TypeError, ValueError):
+                            continue
+                        results.setdefault(str(order_id), []).append(
+                            {'unit_index': unit, 'status': str(status or '')})
+                return results
+            except Exception as e:
+                logger.error(f"批量查询私信通道状态失败: {e}")
+                return results
 
     def get_recent_delivery_logs(self, user_id: int, limit: int = 20):
         """获取最近发货日志（按用户隔离）。"""

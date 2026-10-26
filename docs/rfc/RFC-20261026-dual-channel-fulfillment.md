@@ -132,3 +132,26 @@ delivered/manual_delivered 记录**，时间窗 `chat_gap_scan_window_hours`（�
   否则系统会按设计原样补发私信（买家收到重复消息）；
 - 验收 A1/A2 需等下一笔真实订单；B2 可用 5127563270248090346 实测（接受重复消息），
   或留给下一笔真实订单。
+
+## 7. 第二轮审查修复（2026-10-26，自审 + 运营方复核清单）
+
+| 编号 | 问题 | 修复 |
+| --- | --- | --- |
+| BUG-1【中】 | 巡检侧「人工补发记录」结案不回写风险日志，`chat_notification_gap` 永远停在 processing | 人工结案分支补查并回写 success（XianyuAutoAsync `_handle_chat_notification_gap_order`） |
+| BUG-2【中低】 | 无 chat 行的存量单在人工结案分支空转（每周期重复处理、不结案） | 目标单元改为「未送达 chat 行 ∪ trade_text 完成单元」，无行也能直接结案 |
+| BUG-3【低】 | 缺口 SQL「任一单元 chat 送达即排除整单」，多单元部分未送达会漏扫 | SQL 改为逐单元判定：某 trade_text 单元无对应 delivered/manual_delivered chat 行即命中 |
+| BUG-4【低】 | 巡检自动补发与控制台手动补发并发可能双发消息 | 实例级 in-flight 集合（`_chat_gap_resend_inflight`）两路共用，发送段 try/finally 保护 |
+| BUG-6【低】 | sid 缺失时 buyer_id 兜底当 cid，长连接路由不可靠、白烧补发计次 | 巡检自动补发一律要求 sid，缺失转人工告警（控制台手动路径保留兜底先例：人工触发、失败即时可见） |
+| BUG-7【极低】 | 旧 GapScanTests 未 mock 新增查询，读真实库（隔离性瑕疵） | setUp 统一 patch `get_chat_notification_gap_orders` |
+| 遗漏-1【中】 | C3「履约完整」无对外可见标记 | `GET /api/orders` 为直填订单附加只读派生字段 `fulfillment`（trade_text/chat 各自送达单元 + `complete` 布尔；两条按账号批量查询，不逐单查库；旧单通道订单不携带） |
+| 遗漏-3【低】 | 直填即时告警缺下单时间/滞留时长（2.6 要素不全） | 直填路径查订单行补齐 created_at + 滞留时长 |
+| BUG-5【低，接受现状】 | 「发送成功→落 delivered」之间进程崩溃，宽限后会补发一条重复消息 | **设计取舍，不改**：先标后发违反「未收到回执不得标送达」红线，先发后标存在窄崩溃窗口。at-least-once 语义 + 宽限 + 单次重试，最坏重复一条，与 2.7 风险相称 |
+
+测试：195 → 204 passed（新增 9 例覆盖上表全部修复项；BUG-5 无行为变更无新测试）。
+
+### 7.1 遗留事项（非代码）
+
+- 上游合并策略（需求三.3 要求开发方评估）：**建议先双通道（已完成）、尽快专项合并上游**。
+  上游 25+ 提交含跨用户消息发送漏洞修复（安全优先）；双通道改动为增量式，冲突面集中在
+  `secure_confirm_decrypted.py` auto_confirm（上游凭证空值 vs 我方填内容，冲突早于本次改造已存在）
+  与手动发货端点。合并时 tradeText 冲突保我方版本，跑全量测试回归。

@@ -2198,6 +2198,7 @@ class XianyuLive:
         self._delivery_gap_attempt_last = {}  # 缺口订单补写发货凭证的尝试冷却
         self._delivery_gap_patrol_task = None  # 履约一致性巡检任务（与WebSocket连接状态无关）
         self._last_orders_recovery_sync_time = 0.0  # 掉线恢复补拉的最近一次调度时间（最小间隔保护）
+        self._chat_gap_resend_inflight = set()  # 私信补发并发守卫（巡检与控制台手动补发共用）
         self.pending_platform_confirm_retry_lock = asyncio.Lock()  # 待补确认自动重试锁
         self.last_pending_platform_confirm_retry_time = 0.0
         self.pending_platform_confirm_retry_cooldown = 60  # 1分钟内不重复自动扫描待补确认订单
@@ -4174,10 +4175,17 @@ class XianyuLive:
                     status='failed', reason=f'{source} 私聊补充告知未送达: {reason_text}',
                     channel='chat',
                 )
+                try:
+                    order_row = db_manager.get_order_by_id(order_id) or {}
+                except Exception:
+                    order_row = {}
+                created_at_text = str((order_row or {}).get('created_at') or '')
                 await self._send_ops_alert(
                     f'chat_gap:{order_id}',
                     self._build_chat_gap_alert_message(
                         order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                        created_at_text=created_at_text,
+                        age_text=self._format_age_text(created_at_text),
                         chat_reason=reason_text, sent_hint_units=prepared_units,
                         plan_text=(f'系统将在宽限期约 {max(1, grace_seconds // 60)} 分钟后自动补发私信'
                                    if grace_seconds > 0 else '系统将在下一巡检周期自动补发私信'),
@@ -4754,15 +4762,28 @@ class XianyuLive:
         if not order_id:
             return False
 
-        # 控制台人工补发过（delivery_logs channel='manual' success）→ 直接结案，绝不重复发
+        # 控制台人工补发过（delivery_logs channel='manual' success）→ 直接结案，绝不重复发。
+        # 目标单元 = 未送达 chat 行 ∪ trade_text 完成单元（部署前直填的存量单没有 chat 行也能结案），
+        # 并回写之前周期可能已创建的缺口风险日志（否则风控面板残留 processing）。
         try:
             if db_manager.has_manual_delivery_success(order_id):
-                undelivered = [s for s in db_manager.get_delivery_channel_states(order_id)
-                               if s.get('channel') == 'chat' and s.get('status') in ('pending', 'failed')]
-                if undelivered:
-                    for state in undelivered:
+                chat_states_now = [s for s in db_manager.get_delivery_channel_states(order_id)
+                                   if s.get('channel') == 'chat']
+                undelivered = [s for s in chat_states_now
+                               if s.get('status') in ('pending', 'failed')]
+                trade_text_units = set()
+                for state in db_manager.get_delivery_finalization_states(order_id):
+                    if state.get('channel') != 'trade_text':
+                        continue
+                    try:
+                        trade_text_units.add(int(state.get('unit_index') or 1))
+                    except (TypeError, ValueError):
+                        continue
+                target_units = trade_text_units | {s.get('unit_index') for s in undelivered}
+                if target_units:
+                    for unit_index in sorted(target_units):
                         db_manager.upsert_delivery_channel_state(
-                            order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
+                            order_id=order_id, unit_index=unit_index, channel='chat',
                             status='manual_delivered', last_error='',
                             cookie_id=self.cookie_id, item_id=item_id, buyer_id=buyer_id)
                     self._record_delivery_log(
@@ -4771,7 +4792,16 @@ class XianyuLive:
                         channel='manual_confirm',
                     )
                     logger.warning(f"【{self.cookie_id}】{source} 检测到人工补发记录，私信缺口结案: {order_id}")
-                return bool(undelivered)
+                try:
+                    existing_gap_log = db_manager.get_latest_delivery_gap_risk_log(
+                        self.cookie_id, order_id, event_type='chat_notification_gap')
+                    if existing_gap_log and existing_gap_log.get('id'):
+                        db_manager.update_risk_control_log(
+                            existing_gap_log['id'], processing_status='success',
+                            processing_result='检测到人工补发成功记录，私信缺口结案')
+                except Exception:
+                    pass
+                return bool(target_units)
         except asyncio.CancelledError:
             raise
         except Exception as manual_check_error:
@@ -4889,11 +4919,13 @@ class XianyuLive:
                 cooldown_seconds=43200)
             return False
         sid = str(order.get('sid') or '').strip()
-        chat_id = (sid.replace('@goofish', '') if sid else '') or buyer_id
-        if not chat_id:
-            await _emit_chat_gap_alert('无会话ID（无sid且无买家ID），无法补发私信，需人工处理',
+        if not sid:
+            # 持久长连接私发必须用会话 cid（来自 sid）；buyer_id 兜底在长连接上路由不可靠，
+            # 只会白烧一次补发计次——自动补发一律要求 sid，缺 sid 转人工（控制台手动路径保留兜底先例）
+            await _emit_chat_gap_alert('订单无会话ID（sid），无法经长连接自动补发私信，需人工处理',
                                        cooldown_seconds=43200)
             return False
+        chat_id = sid.replace('@goofish', '')
 
         steps = []
         used_units = []
@@ -4913,66 +4945,80 @@ class XianyuLive:
             f"单元数={len(used_units)}, 步骤数={len(steps)}（原样快照，不重新取卡密）"
         )
         user_url = f'https://www.goofish.com/personal?userId={buyer_id}'
-        send_error = ''
-        try:
-            await self._send_delivery_steps(
-                websocket, chat_id, buyer_id, steps,
-                user_url=user_url,
-                log_prefix=f'{source} 私信缺口自动补发',
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as send_exc:
-            send_error = self._safe_str(send_exc)
 
-        backoff_base = self._get_chat_gap_resend_backoff_base_seconds()
+        # 并发守卫：巡检与控制台手动补发可能同时触发同一订单，in-flight 期间只允许一路发送——
+        # 幂等保护只防状态双写，防不了消息双发（买家收到重复消息）
+        inflight = getattr(self, '_chat_gap_resend_inflight', None)
+        if inflight is None:
+            inflight = set()
+            self._chat_gap_resend_inflight = inflight
+        if order_id in inflight:
+            logger.info(f"【{self.cookie_id}】{source} 该订单私信补发已在进行中，跳过并发触发: {order_id}")
+            return False
+        inflight.add(order_id)
         try:
-            backoff_cap = float(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600)
-        except (TypeError, ValueError):
-            backoff_cap = 3600.0
-        next_backoff = float(min(backoff_base * (2 ** attempts), backoff_cap))
+            send_error = ''
+            try:
+                await self._send_delivery_steps(
+                    websocket, chat_id, buyer_id, steps,
+                    user_url=user_url,
+                    log_prefix=f'{source} 私信缺口自动补发',
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as send_exc:
+                send_error = self._safe_str(send_exc)
 
-        if not send_error:
+            backoff_base = self._get_chat_gap_resend_backoff_base_seconds()
+            try:
+                backoff_cap = float(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600)
+            except (TypeError, ValueError):
+                backoff_cap = 3600.0
+            next_backoff = float(min(backoff_base * (2 ** attempts), backoff_cap))
+
+            if not send_error:
+                for state in used_units:
+                    db_manager.upsert_delivery_channel_state(
+                        order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
+                        status='delivered', last_error='',
+                        cookie_id=self.cookie_id, item_id=item_id, buyer_id=buyer_id)
+                self._record_delivery_log(
+                    order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
+                    status='success', reason=f'{source} 私信通知缺口自动补发成功（原样快照重发）',
+                    channel='chat',
+                )
+                _resolve_chat_gap_log('私信通知自动补发成功，缺口结案')
+                await self._send_ops_alert(
+                    f'chat_gap:{order_id}',
+                    f"✅ 私信通知缺口已自愈: 订单 {order_id} 补发私信成功（原样快照），双通道履约完整。",
+                    cooldown_seconds=7200)
+                return True
+
+            # 补发失败：计次 + 指数退避；达到上限转为终态告警
+            new_attempts = attempts + 1
+            reached_limit = new_attempts >= max_attempts
+            next_retry_text = self._utc_db_timestamp(next_backoff)
             for state in used_units:
                 db_manager.upsert_delivery_channel_state(
                     order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
-                    status='delivered', last_error='',
+                    status='failed' if reached_limit else 'pending',
+                    last_error=f'自动补发失败: {send_error}',
+                    bump_attempt=True,
+                    next_retry_at=None if reached_limit else next_retry_text,
                     cookie_id=self.cookie_id, item_id=item_id, buyer_id=buyer_id)
-            self._record_delivery_log(
-                order_id=order_id, item_id=item_id, buyer_id=buyer_id, buyer_nick=buyer_nick,
-                status='success', reason=f'{source} 私信通知缺口自动补发成功（原样快照重发）',
-                channel='chat',
-            )
-            _resolve_chat_gap_log('私信通知自动补发成功，缺口结案')
-            await self._send_ops_alert(
-                f'chat_gap:{order_id}',
-                f"✅ 私信通知缺口已自愈: 订单 {order_id} 补发私信成功（原样快照），双通道履约完整。",
-                cooldown_seconds=7200)
-            return True
-
-        # 补发失败：计次 + 指数退避；达到上限转为终态告警
-        new_attempts = attempts + 1
-        reached_limit = new_attempts >= max_attempts
-        next_retry_text = self._utc_db_timestamp(next_backoff)
-        for state in used_units:
-            db_manager.upsert_delivery_channel_state(
-                order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
-                status='failed' if reached_limit else 'pending',
-                last_error=f'自动补发失败: {send_error}',
-                bump_attempt=True,
-                next_retry_at=None if reached_limit else next_retry_text,
-                cookie_id=self.cookie_id, item_id=item_id, buyer_id=buyer_id)
-        from datetime import datetime as _dt
-        if reached_limit:
-            await _emit_chat_gap_alert(
-                f'自动补发失败 {new_attempts}/{max_attempts} 次，已达上限停止自动重试，需人工介入',
-                cooldown_seconds=43200, chat_reason=f'自动补发失败: {send_error}')
-        else:
-            retry_at_text = _dt.fromtimestamp(now + next_backoff).strftime('%H:%M')
-            await _emit_chat_gap_alert(
-                f'已自动重试 {new_attempts}/{max_attempts} 次，约 {retry_at_text} 再次自动补发',
-                cooldown_seconds=7200, chat_reason=f'自动补发失败: {send_error}')
-        return False
+            from datetime import datetime as _dt
+            if reached_limit:
+                await _emit_chat_gap_alert(
+                    f'自动补发失败 {new_attempts}/{max_attempts} 次，已达上限停止自动重试，需人工介入',
+                    cooldown_seconds=43200, chat_reason=f'自动补发失败: {send_error}')
+            else:
+                retry_at_text = _dt.fromtimestamp(now + next_backoff).strftime('%H:%M')
+                await _emit_chat_gap_alert(
+                    f'已自动重试 {new_attempts}/{max_attempts} 次，约 {retry_at_text} 再次自动补发',
+                    cooldown_seconds=7200, chat_reason=f'自动补发失败: {send_error}')
+            return False
+        finally:
+            inflight.discard(order_id)
 
     def _format_age_text(self, created_at_text) -> str:
         """把库内创建时间转成人类可读的滞留时长（UTC 基准）。"""

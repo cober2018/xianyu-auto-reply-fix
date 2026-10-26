@@ -602,6 +602,13 @@ class TokenNotifyCooldownTests(unittest.TestCase):
 
 
 class GapScanTests(unittest.TestCase):
+    def setUp(self):
+        # 私信缺口扫描直连 db_manager 单例：挡住新查询，避免测试读真实库（隔离性）
+        patcher = mock.patch.object(dbm.db_manager, 'get_chat_notification_gap_orders',
+                                    return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_scan_routes_gap_orders(self):
         import db_manager as dbm
         live = _direct_live('scan-unit')
