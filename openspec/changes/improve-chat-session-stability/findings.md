@@ -2,6 +2,8 @@
 
 ## 2026-10-26 实现阶段结论
 
+- 当前交付位置已迁回本地 main，代码实现提交 `6cfb35a`；融合后既有回归与规范校验通过。成果目录已实体化，不依赖开发工作树的绝对链接。
+
 - 开发基线由用户明确指定为本地 `main@be22c9d`。服务器不可访问，不再用本机旧进程推断生产状态。
 - 正常就绪序列来自固定版本 [goofish-cli wait_ready](https://github.com/fancyboi999/goofish-cli/blob/5b6b64ca72c54038874d57d61384765ee4e9b2be/src/goofish_cli/core/ws.py) 与其[既有就绪 fixture](https://github.com/fancyboi999/goofish-cli/blob/5b6b64ca72c54038874d57d61384765ee4e9b2be/tests/test_ws_ready.py)：匹配注册回包成功后，还需 `/s/vulcan`；`ackDiff` 返回非成功不能单独证明注册失败。本地历史读取逻辑也识别 `/s/vulcan`。这些是协议实现证据，不能代替本账号现场帧。
 - 只用实例身份不足以保护临时 HTTP 实例；只比较 Cookie 字符串又会把正常轮换变成永久停聊。最终采用进程内交接代次识别人工换会话，响应条件写回校验请求快照，认证前从现有数据库同步正常 Cookie 轮换。

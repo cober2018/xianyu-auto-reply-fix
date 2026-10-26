@@ -1,5 +1,15 @@
 # 项目进度
 
+## 2026-10-26：本地 main 融合完成
+
+- 用户已明确授权。实现以白名单 19 个文件提交为 `6cfb35a8d519f331e93ace2491c9ded0a39af81f`，随后本地 main 从 `be22c9d` 快进到该提交，未引入其他分支改动。
+- 融合前核对 main 仅有本需求 .gitignore/README 改动、索引为空；确认这些内容均包含在最终成果后备份并融合。备份及开发验证材料保存在 `.git/codex-main-integration-backups/20261026-chat-session-stability/`。
+- 唯一成果目录已迁回 `/Users/mshengran/Project/xianyu-auto-reply-fix/openspec/changes/improve-chat-session-stability/`，现在是 main 跟踪的实体目录；根 task_plan、progress、findings 兼容链接均已回读有效。
+- main 上重新执行 7 个既有测试文件，**80 passed**，2 条既存 FastAPI 弃用提醒；Python py_compile、JS 语法、git diff 格式及 OpenSpec 严格校验通过。验证使用 main 的独立 `.cache/chat-session-validation/local-main-merge.sqlite3`，未新增或修改测试。
+- 开发树已无未提交改动。Codex archive_worktree 返回 The task's primary checkout cannot be removed，故保留该开发树和分支；其中的验证材料已另存，不影响 main 的代码与成果独立使用。
+- 此后文档回执仅在 main 维护并提交；运行验收项 4.2、5.1–5.3 保持未完成。没有推送、发布、重启、真实会话发信或修改生产数据，也未将本地融合当作稳定性验收。
+- 本轮实际使用 skill：using-superpowers、writing-plans、finishing-a-development-branch、verification-before-completion。
+
 ## 2026-10-26：本地 main 融合开始
 
 - 用户明确要求将本次代码融合到本地 main；沿用同一需求，不增加推送、部署或生产操作范围。

@@ -1,6 +1,6 @@
 # 聊天会话稳定性
 
-当前阶段：**本地实现与复核完成，待运行验收**。需求 ID：`improve-chat-session-stability`。日期：2026-10-26。
+当前阶段：**已融合本地 main，待运行验收**。需求 ID：`improve-chat-session-stability`。日期：2026-10-26。
 
 ## PRD / 需求背景
 
@@ -8,9 +8,11 @@
 
 ## 代码位置与版本
 
-- 工作区：`/Users/mshengran/.codex/worktrees/chat-session-stability/xianyu-auto-reply-fix`；分支 `codex/chat-session-stability`。
+- 当前代码与唯一成果目录所在工作区：`/Users/mshengran/Project/xianyu-auto-reply-fix`，分支 `main`。
+- 实现提交：`6cfb35a8d519f331e93ace2491c9ded0a39af81f`；本地融合回执为其后续文档提交，当前版本以 `git rev-parse main` 为准。
 - 本地基线：`main@be22c9de97733aa53f1184a0009a3085b4c42409`。
-- 业务代码改动尚未提交、未合并 main、未推送或部署。原工作区的本需求目录和根目录兼容入口均指向本目录。服务器版本按用户提供的本地 main 基线开发，未操作生产，也未把本机旧进程当作生产实例。
+- 用户已授权融合本地 main，快进和合并后校验均已完成；未推送或部署。本目录在 main 中是实体目录，根目录兼容链接就地指向本目录，不再依赖开发工作树。
+- 开发工作树为 Codex 本会话主工作区，归档工具拒绝删除，暂予保留；后续成果只维护 main 中本目录。
 
 ## 成果目录结构
 
@@ -36,7 +38,7 @@
 
 ## 待完成 / TODO
 
-- 本地实现、80 项既有回归与限定范围代码复核已完成；尚缺服务器联调及连续观察。
+- 本地实现、代码复核与 main 融合已完成；尚缺服务器联调及连续观察。
 - 在可访问服务器环境核准实际版本、现场握手、对端接收、并发联调与至少 72 小时自然运行。
 - 完成约定验收后 archive；浏览器常驻方案保留为有条件的后续试验。
 
@@ -55,6 +57,8 @@
 
 ## 下一步
 
-完成本地验证与交接；部署、真实对端接收及 72 小时验收由后续可访问服务器的环境执行，完成后 archive。
+部署、真实对端接收及 72 小时验收由后续可访问服务器的环境执行，完成后 archive。
 
-本轮使用 skill：`using-superpowers`、`executing-plans`、`using-git-worktrees`、`openspec-apply-change`、`systematic-debugging`、`verification-before-completion`、`finishing-a-development-branch`。未生成或修改测试代码。
+开发阶段使用 skill：`using-superpowers`、`executing-plans`、`using-git-worktrees`、`openspec-apply-change`、`systematic-debugging`、`verification-before-completion`、`finishing-a-development-branch`。未生成或修改测试代码。
+
+本地融合阶段使用 skill：`using-superpowers`、`writing-plans`、`finishing-a-development-branch`、`verification-before-completion`。
