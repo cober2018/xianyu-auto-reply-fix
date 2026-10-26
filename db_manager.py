@@ -705,6 +705,31 @@ class DBManager:
             ''')
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_finalization_states_status ON delivery_finalization_states(status, updated_at)")
 
+            # 双通道独立记账：发货凭证直填（trade_text）与私信通知（chat）各自一条状态行，
+            # 唯一约束含 channel，两个通道在同一订单同一单元可共存、互不覆盖。
+            # 存量订单在本表无行 → 私信缺口扫描（要求 trade_text 送达证据）不会命中历史订单。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_channel_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                unit_index INTEGER NOT NULL DEFAULT 1,
+                cookie_id TEXT,
+                item_id TEXT,
+                buyer_id TEXT,
+                channel TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                content_snapshot TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                next_retry_at TIMESTAMP,
+                delivered_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(order_id, unit_index, channel)
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_channel_states_status ON delivery_channel_states(channel, status, updated_at)")
+
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS data_card_reservations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5619,8 +5644,11 @@ Cookie数量: {cookie_count}
                 logger.error(f"查询滞留待发货订单失败: cookie_id={cookie_id} - {e}")
                 return []
 
-    def get_latest_delivery_gap_risk_log(self, cookie_id: str, order_id: str):
-        """获取该订单最近一条履约缺口风险日志（delivery_gap 巡检去重与结案回写用）。"""
+    def get_latest_delivery_gap_risk_log(self, cookie_id: str, order_id: str, event_type: str = 'delivery_gap'):
+        """获取该订单最近一条履约缺口风险日志（巡检去重与结案回写用）。
+
+        event_type 可选：'delivery_gap'（平台发货凭证缺口）/ 'chat_notification_gap'（私信通知缺口）。
+        """
         if not cookie_id or not order_id:
             return None
         with self.lock:
@@ -5629,12 +5657,12 @@ Cookie数量: {cookie_count}
                 cursor.execute(
                     '''
                     SELECT id, processing_status FROM risk_control_logs
-                    WHERE cookie_id = ? AND event_type = 'delivery_gap'
+                    WHERE cookie_id = ? AND event_type = ?
                       AND event_description LIKE ?
                     ORDER BY id DESC
                     LIMIT 1
                     ''',
-                    (cookie_id, f'%order_id={order_id}%')
+                    (cookie_id, event_type, f'%order_id={order_id}%')
                 )
                 row = cursor.fetchone()
                 if not row:
@@ -5667,6 +5695,158 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"查询手动发货成功记录失败: order_id={order_id} - {e}")
                 return False
+
+    def upsert_delivery_channel_state(self, order_id: str, unit_index: int, channel: str, status: str,
+                                      cookie_id: str = None, item_id: str = None, buyer_id: str = None,
+                                      content_snapshot: str = None, last_error: str = None,
+                                      bump_attempt: bool = False, next_retry_at: str = None) -> bool:
+        """写入/更新双通道通道状态（trade_text / chat 各自一行，互不覆盖）。
+
+        幂等红线：已 delivered / manual_delivered 的行永不允许降级回 pending/failed，
+        保证「补发成功后重复写入」不会把已送达通道重新变成缺口。
+        next_retry_at 传 None 时保留原值（只有 pending/failed 重试调度时才显式传）。
+        """
+        if not order_id or not channel:
+            return False
+        normalized_status = str(status or 'pending').strip() or 'pending'
+        try:
+            unit = max(1, int(unit_index or 1))
+        except (TypeError, ValueError):
+            unit = 1
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, '''
+                INSERT INTO delivery_channel_states (
+                    order_id, unit_index, cookie_id, item_id, buyer_id, channel, status,
+                    content_snapshot, attempt_count, last_error, next_retry_at, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?,
+                          CASE WHEN ? IN ('delivered', 'manual_delivered') THEN CURRENT_TIMESTAMP ELSE NULL END)
+                ON CONFLICT(order_id, unit_index, channel) DO UPDATE SET
+                    cookie_id = COALESCE(excluded.cookie_id, delivery_channel_states.cookie_id),
+                    item_id = COALESCE(excluded.item_id, delivery_channel_states.item_id),
+                    buyer_id = COALESCE(excluded.buyer_id, delivery_channel_states.buyer_id),
+                    status = CASE
+                        WHEN delivery_channel_states.status IN ('delivered', 'manual_delivered')
+                            THEN delivery_channel_states.status
+                        ELSE excluded.status END,
+                    content_snapshot = COALESCE(excluded.content_snapshot, delivery_channel_states.content_snapshot),
+                    attempt_count = delivery_channel_states.attempt_count + ?,
+                    last_error = COALESCE(excluded.last_error, delivery_channel_states.last_error),
+                    next_retry_at = COALESCE(?, delivery_channel_states.next_retry_at),
+                    delivered_at = CASE
+                        WHEN delivery_channel_states.status IN ('delivered', 'manual_delivered')
+                            THEN delivery_channel_states.delivered_at
+                        WHEN excluded.status IN ('delivered', 'manual_delivered')
+                            THEN CURRENT_TIMESTAMP
+                        ELSE delivery_channel_states.delivered_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                ''', (order_id, unit, cookie_id, item_id, buyer_id, channel, normalized_status,
+                      content_snapshot, 1 if bump_attempt else 0, last_error, next_retry_at,
+                      normalized_status,
+                      1 if bump_attempt else 0,
+                      next_retry_at))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"更新通道状态失败: order_id={order_id}, channel={channel} - {e}")
+                self.conn.rollback()
+                return False
+
+    def get_delivery_channel_states(self, order_id: str):
+        """获取订单全部通道状态行（含 trade_text / chat）。"""
+        if not order_id:
+            return []
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT order_id, unit_index, cookie_id, item_id, buyer_id, channel, status,
+                       content_snapshot, attempt_count, last_error, next_retry_at,
+                       delivered_at, created_at, updated_at
+                FROM delivery_channel_states
+                WHERE order_id = ?
+                ORDER BY channel ASC, unit_index ASC
+                ''', (order_id,))
+                return [
+                    {
+                        'order_id': row[0],
+                        'unit_index': row[1],
+                        'cookie_id': row[2],
+                        'item_id': row[3],
+                        'buyer_id': row[4],
+                        'channel': row[5],
+                        'status': row[6],
+                        'content_snapshot': row[7],
+                        'attempt_count': row[8],
+                        'last_error': row[9],
+                        'next_retry_at': row[10],
+                        'delivered_at': row[11],
+                        'created_at': row[12],
+                        'updated_at': row[13],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"获取通道状态失败: order_id={order_id} - {e}")
+                return []
+
+    def get_chat_notification_gap_orders(self, cookie_id: str, within_hours: int = 72, limit: int = 10) -> list:
+        """扫描「发货凭证已送达、私信通知未送达」的缺口订单（私信缺口巡检用）。
+
+        判据：存在 channel='trade_text' 的完成记录（只有直填新链路会写，存量老订单天然不命中），
+        且不存在 channel='chat' 的 delivered/manual_delivered 记录。
+        时间窗按订单创建时间（UTC SQL 比较），窗口内的老缺口（如直填成功但当时无通道行）也会被捞回。
+        只读，不回填。
+        """
+        if not cookie_id:
+            return []
+        try:
+            safe_hours = max(1, int(within_hours or 72))
+        except (TypeError, ValueError):
+            safe_hours = 72
+        safe_limit = max(1, min(int(limit or 10), 100))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT o.order_id, o.item_id, o.buyer_id, o.buyer_nick, o.sid,
+                           o.order_status, o.created_at, o.updated_at
+                    FROM orders o
+                    WHERE o.cookie_id = ?
+                      AND datetime(o.created_at) > datetime('now', ?)
+                      AND EXISTS (
+                          SELECT 1 FROM delivery_finalization_states f
+                          WHERE f.order_id = o.order_id AND f.channel = 'trade_text'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_channel_states c
+                          WHERE c.order_id = o.order_id AND c.channel = 'chat'
+                            AND c.status IN ('delivered', 'manual_delivered')
+                      )
+                    ORDER BY datetime(o.created_at) ASC
+                    LIMIT ?
+                    ''',
+                    (cookie_id, f'-{safe_hours} hours', safe_limit)
+                )
+                return [
+                    {
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': row[3],
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'created_at': row[6],
+                        'updated_at': row[7],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"查询私信通知缺口订单失败: cookie_id={cookie_id} - {e}")
+                return []
 
     def get_recent_delivery_logs(self, user_id: int, limit: int = 20):
         """获取最近发货日志（按用户隔离）。"""

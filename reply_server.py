@@ -14326,6 +14326,100 @@ async def retry_order_platform_confirm(order_id: str, current_user: Dict[str, An
         return {"success": False, "confirmed": False, "message": f"补确认失败: {str(e)}"}
 
 
+def _resolve_chat_gap_risk_log(cookie_id: str, order_id: str, result_text: str) -> None:
+    """私信缺口风险日志结案回写（幂等，失败不抛出）。"""
+    try:
+        gap_log = db_manager.get_latest_delivery_gap_risk_log(
+            cookie_id, order_id, event_type='chat_notification_gap')
+        if gap_log and gap_log.get('id'):
+            db_manager.update_risk_control_log(
+                gap_log['id'], processing_status='success', processing_result=str(result_text)[:200])
+    except Exception as exc:
+        logger.warning(f"私信缺口风险日志结案失败: order_id={order_id}, error={exc}")
+
+
+async def _resend_order_chat_notification_snapshot(xianyu_instance, order: dict, cookie_id: str,
+                                                   current_user: dict):
+    """手动发货入口的私信缺口原样补发：发货单元履约已完成但私信未送达时，从快照重发并结案。
+
+    返回 None = 无私信缺口（调用方继续原有流程）；dict = 已处理（直接作为接口返回）。
+    补发内容取自通道状态行里保存的发送快照——不重新取卡密、不重新匹配规则。
+    """
+    order_id = str(order.get('order_id') or '').strip()
+    item_id = str(order.get('item_id') or '').strip()
+    buyer_id = str(order.get('buyer_id') or '').strip()
+
+    def _undelivered_chat_states():
+        return [s for s in (db_manager.get_delivery_channel_states(order_id) or [])
+                if s.get('channel') == 'chat' and s.get('status') in ('pending', 'failed')]
+
+    undelivered = _undelivered_chat_states()
+    if not undelivered and xianyu_instance is not None:
+        # 部署前直填的存量订单没有 chat 行：按直填完成记录回填后再判断
+        try:
+            if xianyu_instance._backfill_chat_states_from_finalization(order_id, item_id, buyer_id):
+                undelivered = _undelivered_chat_states()
+        except Exception as backfill_exc:
+            logger.warning(f"私信通道账回填失败: order_id={order_id}, error={backfill_exc}")
+    if not undelivered:
+        return None
+
+    steps = []
+    used_units = []
+    for state in undelivered:
+        unit_steps = xianyu_instance._parse_channel_snapshot_steps(state.get('content_snapshot'))
+        if not unit_steps:
+            continue
+        steps.extend(unit_steps)
+        used_units.append(state)
+    if not steps:
+        return {"success": False, "delivered": True,
+                "message": "检测到私信通知未送达，但补发快照缺失，请人工核实后在闲鱼App私信补发"}
+
+    ws = getattr(xianyu_instance, 'ws', None)
+    sid = str(order.get('sid') or '').strip()
+    chat_id = (sid.replace('@goofish', '') if sid else '') or buyer_id
+    if not ws or not chat_id:
+        return {"success": False, "delivered": True,
+                "message": ("长连接未就绪，暂无法补发私信；可在长连接恢复后重试，"
+                            f"或调 POST /api/orders/{order_id}/chat-notification/manual-mark 标记已人工送达")}
+
+    try:
+        await xianyu_instance._send_delivery_steps(
+            ws, chat_id, buyer_id, steps,
+            log_prefix=f'手动补发私信通知 order_id={order_id}')
+    except Exception as send_error:
+        reason = str(send_error)
+        for state in used_units:
+            db_manager.upsert_delivery_channel_state(
+                order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
+                status='pending', last_error=f'手动补发失败: {reason}', bump_attempt=True,
+                cookie_id=cookie_id, item_id=item_id, buyer_id=buyer_id)
+        db_manager.create_delivery_log(
+            user_id=current_user['user_id'], cookie_id=cookie_id, order_id=order_id,
+            item_id=item_id, buyer_id=buyer_id, buyer_nick=order.get('buyer_nick'),
+            channel='chat', status='failed',
+            reason=f'控制台手动补发私信失败: {reason}')
+        return {"success": False, "delivered": True,
+                "message": f"私信补发失败: {reason}（已记录，长连接恢复后可重试）"}
+
+    for state in used_units:
+        db_manager.upsert_delivery_channel_state(
+            order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
+            status='delivered', last_error='',
+            cookie_id=cookie_id, item_id=item_id, buyer_id=buyer_id)
+    db_manager.create_delivery_log(
+        user_id=current_user['user_id'], cookie_id=cookie_id, order_id=order_id,
+        item_id=item_id, buyer_id=buyer_id, buyer_nick=order.get('buyer_nick'),
+        channel='chat', status='success',
+        reason='控制台手动补发私信成功（原样快照，双通道履约完整）')
+    _resolve_chat_gap_risk_log(cookie_id, order_id, '控制台手动补发私信成功，缺口结案')
+    publish_order_update_event(order_id, source='manual_chat_resend')
+    log_with_user('info', f"手动发货: 订单 {order_id} 私信通知已原样补发（双通道履约完整）", current_user)
+    return {"success": True, "delivered": True, "channel": "chat",
+            "message": "发货单元已全部完成；检测到私信通知未送达，已原样补发私信并结案缺口"}
+
+
 @app.post('/api/orders/{order_id}/deliver')
 async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """手动发货 - 根据订单信息匹配发货规则并发送卡券"""
@@ -14461,6 +14555,11 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
 
         remaining_unit_indexes = list(progress_after_finalize.get('remaining_unit_indexes') or [])
         if not remaining_unit_indexes:
+            # 双通道补发：发货单元已全部完成，但私信通知未送达 → 从快照原样补发并结案（A6）
+            chat_resend_result = await _resend_order_chat_notification_snapshot(
+                xianyu_instance, order, cookie_id, current_user)
+            if chat_resend_result is not None:
+                return chat_resend_result
             aggregate_status = progress_after_finalize.get('aggregate_status')
             if aggregate_status == 'shipped':
                 return {"success": True, "delivered": True, "message": "订单所有发货单元都已完成，本次仅补完成未收尾记录"}
@@ -14882,6 +14981,71 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         import traceback
         logger.error(f"手动发货异常堆栈: {traceback.format_exc()}")
         return {"success": False, "delivered": False, "message": f"发货失败: {str(e)}"}
+
+
+@app.post('/api/orders/{order_id}/chat-notification/manual-mark')
+async def mark_chat_notification_manually_delivered(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """标记私信通知已人工送达（已在闲鱼App手工补发场景）：只落账结案，不再发送任何消息。
+
+    用于系统有「私信未送达」缺口、但运营方已在手机 App 手工补发且系统无日志的订单——
+    标记后巡检不再自动补发，避免买家收到重复消息。
+    """
+    try:
+        import cookie_manager
+
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            return {"success": False, "message": "订单不存在"}
+        cookie_id = order.get('cookie_id')
+        if not cookie_id:
+            return {"success": False, "message": "订单缺少账号信息"}
+        cookie_info = db_manager.get_cookie_details(cookie_id)
+        if not cookie_info or cookie_info.get('user_id') != current_user['user_id']:
+            return {"success": False, "message": "无权操作此订单"}
+
+        item_id = order.get('item_id')
+        buyer_id = order.get('buyer_id')
+
+        def _undelivered_chat_states():
+            return [s for s in (db_manager.get_delivery_channel_states(order_id) or [])
+                    if s.get('channel') == 'chat' and s.get('status') in ('pending', 'failed')]
+
+        undelivered = _undelivered_chat_states()
+        if not undelivered:
+            xianyu_instance = cookie_manager.manager.get_xianyu_instance(cookie_id) if cookie_manager.manager else None
+            if xianyu_instance is not None:
+                try:
+                    if xianyu_instance._backfill_chat_states_from_finalization(order_id, item_id, buyer_id):
+                        undelivered = _undelivered_chat_states()
+                except Exception as backfill_exc:
+                    logger.warning(f"私信通道账回填失败: order_id={order_id}, error={backfill_exc}")
+        if not undelivered:
+            delivered_states = [s for s in (db_manager.get_delivery_channel_states(order_id) or [])
+                                if s.get('channel') == 'chat'
+                                and s.get('status') in ('delivered', 'manual_delivered')]
+            if delivered_states:
+                return {"success": True, "message": "私信通知此前已记录送达，无需重复标记"}
+            return {"success": False, "message": "该订单没有未送达的私信通知缺口，无需标记"}
+
+        for state in undelivered:
+            db_manager.upsert_delivery_channel_state(
+                order_id=order_id, unit_index=state.get('unit_index'), channel='chat',
+                status='manual_delivered', last_error='',
+                cookie_id=cookie_id, item_id=item_id, buyer_id=buyer_id)
+        db_manager.create_delivery_log(
+            user_id=current_user['user_id'], cookie_id=cookie_id, order_id=order_id,
+            item_id=item_id, buyer_id=buyer_id, buyer_nick=order.get('buyer_nick'),
+            channel='manual_confirm', status='success',
+            reason=f"运营方标记私信已人工送达（App内补发），缺口结案: 操作人 {current_user.get('username') or current_user['user_id']}")
+        _resolve_chat_gap_risk_log(cookie_id, order_id, '运营方标记私信已人工送达，缺口结案')
+        publish_order_update_event(order_id, source='chat_manual_mark')
+        log_with_user('info', f"私信通知人工结案: 订单 {order_id}, 单元 {[s.get('unit_index') for s in undelivered]}", current_user)
+        return {"success": True, "message": f"已标记 {len(undelivered)} 个单元私信为人工送达，缺口结案（系统不会再自动补发）"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_with_user('error', f'私信通知人工结案失败: 订单 {order_id}, {exc}', current_user)
+        raise HTTPException(status_code=500, detail=f'标记失败: {exc}')
 
 
 @app.post('/api/orders/{order_id}/refresh')

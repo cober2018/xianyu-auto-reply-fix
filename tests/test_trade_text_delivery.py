@@ -43,6 +43,7 @@ def _direct_live(cookie_id='trade-unit'):
     live._finalize_delivery_after_send = mock.AsyncMock(return_value={'success': True})
     live._persist_delivery_finalization_state = mock.MagicMock(return_value=True)
     live._record_delivery_log = mock.MagicMock()
+    live._record_chat_channel_state = mock.MagicMock()
     live._sync_order_delivery_progress = mock.MagicMock()
     live._activate_delivery_lock = mock.MagicMock()
     live.auto_confirm = mock.AsyncMock(return_value={'success': True, 'order_id': 'po1'})

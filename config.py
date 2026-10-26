@@ -164,8 +164,24 @@ DELIVERY = config.get('DELIVERY', {
     'trade_text_max_length': 500,
     # 凭证失败时是否回落旧私聊链路（true = 不倒退）
     'trade_text_fallback_to_chat': True,
-    # 私聊补充告知失败是否忽略（true = 不影响履约）
+    # 私聊补充告知失败是否忽略（true = 不影响履约；缺口仍会记账并告警）
     'chat_notify_best_effort': True,
+    # 双通道改造：私信缺口自动补发（凭证已送达+私信未送达时，用原样快照补发私信）
+    'chat_gap_auto_resend_enabled': True,
+    # 私信缺口自动补发最大次数（达到后停止重试，转人工告警）
+    'chat_gap_resend_max_attempts': 3,
+    # 首次发现私信缺口到首次自动补发的宽限秒数（默认900=15分钟，覆盖扫码稳定期并留人工反应窗口）
+    'chat_gap_resend_grace_seconds': 900,
+    # 私信补发失败的退避基准秒数（指数翻倍，上限取 RISK_CONTROL.backoff_max_cap_seconds）
+    'chat_gap_resend_backoff_base_seconds': 1800,
+    # 私信缺口扫描时间窗（小时），只扫窗口内的订单
+    'chat_gap_scan_window_hours': 72,
+    # 掉线恢复在线后一次性补拉掉线期间订单（防掉线失明）
+    'orders_recovery_sync_enabled': True,
+    # 掉线恢复补拉的最小间隔秒数（防重连风暴反复拉单）
+    'orders_recovery_sync_min_interval_seconds': 1800,
+    # 掉线恢复补拉的延迟秒数（等连接稳定）
+    'orders_recovery_sync_delay_seconds': 60,
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):

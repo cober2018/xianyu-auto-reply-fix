@@ -104,8 +104,26 @@ DELIVERY:
   trade_text_max_length: 500
   # 凭证接口失败时是否回落旧私聊链路（true = 不倒退）
   trade_text_fallback_to_chat: true
-  # 私聊补充告知失败是否忽略（true = 平台凭证已发货，私聊失败不影响履约）
+  # 私聊补充告知失败是否忽略（true = 平台凭证已发货，私聊失败不影响履约；缺口仍会记账并告警）
   chat_notify_best_effort: true
+  # ── 双通道改造：发货凭证直填与私信通知各自独立记账/巡检/补发 ──
+  # 私信缺口自动补发总开关（发货凭证已送达 + 私信未送达时，用原样快照补发私信；false = 只告警不补发）
+  chat_gap_auto_resend_enabled: true
+  # 私信自动补发最大次数，达到后停止重试并转人工告警
+  chat_gap_resend_max_attempts: 3
+  # 首次发现私信缺口到首次自动补发的宽限秒数（900=15分钟：覆盖扫码稳定期，并留出
+  # 「已在App手工补发→调 manual-mark 结案」的反应窗口，防止买家收到重复消息）
+  chat_gap_resend_grace_seconds: 900
+  # 私信补发失败的退避基准秒数（指数翻倍，上限取 RISK_CONTROL.backoff_max_cap_seconds）
+  chat_gap_resend_backoff_base_seconds: 1800
+  # 私信缺口扫描时间窗（小时）
+  chat_gap_scan_window_hours: 72
+  # 掉线恢复在线后一次性补拉掉线期间订单（防掉线失明；复用近期订单巡检，自带6小时鉴权失败退避）
+  orders_recovery_sync_enabled: true
+  # 掉线恢复补拉最小间隔秒数（防重连风暴反复拉单）
+  orders_recovery_sync_min_interval_seconds: 1800
+  # 掉线恢复补拉延迟秒数（等连接稳定）
+  orders_recovery_sync_delay_seconds: 60
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟
