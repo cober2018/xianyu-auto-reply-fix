@@ -6,9 +6,17 @@
 
 目标：减少重复聊天认证，缩短有效扫码后的恢复等待，并保留现有独立履约语义。架构：沿用账号管理、认证锁、SQLite 和 WS 主循环，补一个聊天验证标记及真实就绪判定。技术栈：Python、FastAPI、SQLite、现有 websockets/Playwright。
 
-## 当前阶段：已融合本地 main，待运行验收
+## 当前阶段：已推送 GitHub main，待运行验收
 
 用户已明确确认本提案并要求开发，以本地 main 为基线。本计划从根目录迁入 `openspec/changes/improve-chat-session-stability/`，沿用原文件；规范、设计与实施步骤已生成，已执行 apply。`tasks.md` 是本文件的同目录链接，供 OpenSpec 识别；按当前实际进展维护下列任务；生产操作与连续观察保留为后续验收。
+
+## Git 推送（2026-10-26，用户已授权）
+
+///
+- [x] G.1 核对 main 工作区、origin URL、远端提交与待推送范围；确认无分歧，远端落后本地 2 个本需求提交。
+- [x] G.2 将 main 普通推送到 origin/main，回读远端 `aa46464`，包含实现 `6cfb35a` 与本地融合回执。
+- [x] G.3 更新同一套 README 与 progress，保持服务器部署、自然运行验收和 OpenSpec archive 待办；文档回执单独提交同步。
+///
 
 ## 本地 main 融合（2026-10-26，用户已授权）
 

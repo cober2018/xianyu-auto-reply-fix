@@ -1,6 +1,6 @@
 # 聊天会话稳定性
 
-当前阶段：**已融合本地 main，待运行验收**。需求 ID：`improve-chat-session-stability`。日期：2026-10-26。
+当前阶段：**已推送 GitHub main，待运行验收**。需求 ID：`improve-chat-session-stability`。日期：2026-10-26。
 
 ## PRD / 需求背景
 
@@ -11,7 +11,7 @@
 - 当前代码与唯一成果目录所在工作区：`/Users/mshengran/Project/xianyu-auto-reply-fix`，分支 `main`。
 - 实现提交：`6cfb35a8d519f331e93ace2491c9ded0a39af81f`；本地融合回执为其后续文档提交，当前版本以 `git rev-parse main` 为准。
 - 本地基线：`main@be22c9de97733aa53f1184a0009a3085b4c42409`。
-- 用户已授权融合本地 main，快进和合并后校验均已完成；未推送或部署。本目录在 main 中是实体目录，根目录兼容链接就地指向本目录，不再依赖开发工作树。
+- 用户已授权融合本地 main，快进和合并后校验均已完成；随后获用户授权，将实现及融合回执推送到 `https://github.com/cober2018/xianyu-auto-reply-fix` 的 main，推送时远端为 `aa46464`。服务器部署和验收仍待完成。本目录在 main 中是实体目录，根目录兼容链接就地指向本目录，不再依赖开发工作树。
 - 开发工作树为 Codex 本会话主工作区，归档工具拒绝删除，暂予保留；后续成果只维护 main 中本目录。
 
 ## 成果目录结构
@@ -62,3 +62,5 @@
 开发阶段使用 skill：`using-superpowers`、`executing-plans`、`using-git-worktrees`、`openspec-apply-change`、`systematic-debugging`、`verification-before-completion`、`finishing-a-development-branch`。未生成或修改测试代码。
 
 本地融合阶段使用 skill：`using-superpowers`、`writing-plans`、`finishing-a-development-branch`、`verification-before-completion`。
+
+Git 推送阶段使用 skill：`using-superpowers`、`verification-before-completion`，沿用本计划记录结果；当前最新文档提交以远端 main 回读为准。

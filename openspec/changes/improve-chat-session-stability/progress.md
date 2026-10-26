@@ -1,5 +1,14 @@
 # 项目进度
 
+## 2026-10-26：GitHub main 推送完成
+
+- 用户明确要求推送 Git。核对本地主工作区干净、main 为 `aa46464c53f7452dedc2c0f775d48f3337a41a92`；origin 为 `https://github.com/cober2018/xianyu-auto-reply-fix.git`。
+- fetch 后远端没有新增提交，本地领先本需求实现与融合回执共 2 个提交；执行普通 `git push origin main:main`，远端从 `be22c9d` 更新至 `aa46464`，随后独立 ls-remote 回读匹配。
+- 本段及 README/计划为后续文档回执提交，业务代码仍为已验证的 `6cfb35a`。当前完整版本以 `git rev-parse main` 与远端 main 一致回读为准。
+- 仓库既有 auto-release 和 docker-image 工作流由 main 推送触发。前者检查 static/version.txt 对应 Release 是否已存在，后者构建/推送镜像；本轮未修改工作流或发起服务器操作，不能据 Git 推送认定生产已加载或验收通过。
+- 原 80 项既有回归及本地 main 校验记录沿用；此次没有修改业务代码或测试，文档通过 diff 格式与 OpenSpec 严格校验。运行验收项 4.2、5.1–5.3 仍未完成。
+- 本轮实际使用 skill：using-superpowers、verification-before-completion。
+
 ## 2026-10-26：本地 main 融合完成
 
 - 用户已明确授权。实现以白名单 19 个文件提交为 `6cfb35a8d519f331e93ace2491c9ded0a39af81f`，随后本地 main 从 `be22c9d` 快进到该提交，未引入其他分支改动。
