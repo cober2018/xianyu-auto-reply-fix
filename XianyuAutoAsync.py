@@ -8,6 +8,7 @@ import os
 import random
 import secrets
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
@@ -327,6 +328,133 @@ class XianyuLive:
     _auth_recovery_locks = {}  # {cookie_id: {'owner': str, 'acquired_at': float, 'expires_at': float}}
     _auth_recovery_lock = threading.Lock()
     _auth_recovery_lock_ttl = 240
+    _verified_chat_handoffs = {}
+    _chat_auth_generations = {}
+
+    @classmethod
+    def validate_chat_handoff(cls, cookie_id: str, cookies_str: str):
+        incoming = trans_cookies(cookies_str or '')
+        missing = cls.protected_merge_cookie_dicts({}, incoming)['missing_required_fields']
+        if missing:
+            raise ValueError(f"聊天凭证缺少必要字段: {', '.join(missing)}")
+        existing = db_manager.get_cookie_details(cookie_id)
+        previous_value = cls._extract_cookie_value(existing)
+        previous = trans_cookies(previous_value) if previous_value else {}
+        if previous.get('unb') and str(previous['unb']) != str(incoming.get('unb')):
+            raise ValueError('聊天凭证不属于目标账号')
+
+    @classmethod
+    def authorize_chat_handoff(cls, cookie_id: str, cookies_str: str):
+        # 完整性与归属由凭证入口在保存前校验；此处只给已验证的快照授权。
+        with cls._auth_recovery_lock:
+            persisted_cookie = db_manager.get_cookie(cookie_id)
+            if persisted_cookie is not None and persisted_cookie != cookies_str:
+                return False
+            cls._chat_auth_generations[cookie_id] = cls._chat_auth_generations.get(cookie_id, 0) + 1
+            cls._verified_chat_handoffs[cookie_id] = {
+                'fingerprint': hashlib.sha256(cookies_str.encode()).hexdigest(),
+                'deadline': time.time() + 30,
+            }
+            active = cls.get_instance(cookie_id)
+            if active:
+                active._auth_superseded = True
+                active.chat_ready = False
+        return True
+
+    @classmethod
+    def consume_chat_handoff(cls, cookie_id: str, cookies_str: str):
+        with cls._auth_recovery_lock:
+            handoff = cls._verified_chat_handoffs.get(cookie_id)
+            if handoff and handoff['fingerprint'] == hashlib.sha256(cookies_str.encode()).hexdigest():
+                return cls._verified_chat_handoffs.pop(cookie_id)
+        return None
+
+    def _chat_auth_is_current(self, check_cookie: bool = True) -> bool:
+        if getattr(self, '_auth_superseded', False):
+            return False
+        generation = getattr(self, '_chat_auth_generation', None)
+        if generation is not None and generation != self._chat_auth_generations.get(self.cookie_id, 0):
+            return False
+        expected_cookie = getattr(self, '_persisted_cookie_value', None)
+        if check_cookie and expected_cookie is not None:
+            current_cookie = db_manager.get_cookie(self.cookie_id)
+            if current_cookie is not None and current_cookie != expected_cookie:
+                return False
+        if getattr(self, 'register_instance', False):
+            return self._instances.get(self.cookie_id, self) is self
+        return True
+
+    def _chat_auth_blocked(self) -> bool:
+        return (bool(getattr(self, 'chat_verification_required', False))
+                or db_manager.get_chat_verification_required(self.cookie_id)
+                or not self._chat_auth_is_current(check_cookie=False))
+
+    @asynccontextmanager
+    async def _chat_auth_recovery(self):
+        owner = f'chat:{id(self)}:{id(asyncio.current_task())}'
+        state = self.get_auth_recovery_lock_state(self.cookie_id)
+        if state and state.get('owner') == owner:
+            yield not self._chat_auth_blocked()
+            return
+        deadline = time.monotonic() + 30
+        acquired = False
+        while not self._chat_auth_blocked():
+            acquired, _ = self.acquire_auth_recovery_lock(self.cookie_id, owner)
+            if acquired or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.1)
+        try:
+            if acquired and not self._chat_auth_blocked():
+                self._reload_latest_cookies_from_db('聊天认证前同步')
+            yield acquired and not self._chat_auth_blocked()
+        finally:
+            if acquired:
+                self.release_auth_recovery_lock(self.cookie_id, owner)
+
+    async def _pause_chat_for_verification(self, reason: str):
+        persisted = False
+        with self._auth_recovery_lock:
+            if not self._chat_auth_is_current():
+                return
+            try:
+                persisted = db_manager.set_chat_verification_required(
+                    self.cookie_id, True, expected_cookie=getattr(self, '_persisted_cookie_value', self.cookies_str)
+                )
+                if not persisted:
+                    logger.info(f"【{self.cookie_id}】丢弃已过期凭证的验证响应")
+                    return
+            except Exception as error:
+                logger.error(f"【{self.cookie_id}】聊天验证暂停持久化失败: {self._safe_str(error)}")
+            active = self.get_instance(self.cookie_id) or self
+            if not active._chat_auth_is_current(check_cookie=False):
+                active = self
+            for live in (self, active):
+                live.chat_verification_required = True
+                live.chat_ready = False
+                live.current_token = None
+                live.last_token_refresh_status = 'chat_verification_required'
+                live.last_token_refresh_error_message = '聊天需要完成平台验证，请更新有效凭证'
+        self._create_risk_log(
+            'chat_verification', '平台要求验证，聊天认证已暂停',
+            processing_status='pending', trigger_scene=reason,
+            result_code='chat_verification_required', event_meta={'pause_persisted': persisted},
+        )
+        logger.warning(f"【{self.cookie_id}】聊天认证已暂停，等待有效凭证更新: {reason}")
+        task = getattr(active, 'heartbeat_task', None)
+        if task and task is not asyncio.current_task():
+            task.cancel()
+        ws = getattr(active, 'ws', None)
+        if ws and not getattr(ws, 'closed', False):
+            try:
+                await asyncio.wait_for(ws.close(), timeout=5)
+            except Exception as error:
+                logger.warning(f"【{self.cookie_id}】关闭受限聊天连接失败: {self._safe_str(error)}")
+        await self.send_token_refresh_notification(self.last_token_refresh_error_message, 'chat_verification_required')
+
+    def _require_chat_ready(self, ws):
+        if (self._chat_auth_blocked() or ws not in getattr(self, '_ready_websockets', set())
+                or getattr(ws, 'closed', False)):
+            raise RuntimeError('聊天尚未就绪或正在等待验证，未发送消息')
 
     # 通用预热 token：用于手动刷新/恢复预检成功后的新实例首轮复用
     _auth_prewarmed_tokens = {}  # {cookie_id: {'token': str, 'timestamp': float, 'source': str}}
@@ -356,7 +484,7 @@ class XianyuLive:
             cls._auth_prewarmed_tokens.pop(cookie_id, None)
 
     @classmethod
-    def cache_auth_prewarmed_token(cls, cookie_id: str, token: str, source: str = 'generic_auth'):
+    def cache_auth_prewarmed_token(cls, cookie_id: str, token: str, source: str = 'generic_auth', cookies_str: str = None):
         """缓存预检成功后的 token，供新实例首轮初始化复用。"""
         if not cookie_id or not token:
             return
@@ -365,6 +493,7 @@ class XianyuLive:
             'token': token,
             'timestamp': time.time(),
             'source': source,
+            'fingerprint': hashlib.sha256(cookies_str.encode()).hexdigest() if cookies_str else None,
         }
 
     @classmethod
@@ -703,6 +832,9 @@ class XianyuLive:
     ) -> bool:
         current_time = current_time or time.time()
         self._consume_qr_login_grace_period_if_expired(current_time)
+        if (getattr(self, "_chat_recovery_task", None) is not None
+                and self._chat_recovery_task is asyncio.current_task()):
+            return False
         remaining = self._get_qr_login_grace_remaining_seconds(current_time)
         if remaining <= 0:
             return False
@@ -967,6 +1099,8 @@ class XianyuLive:
         返回 0 表示不在退避中；否则返回 300~600 秒——期间只做只读检查，
         不发起 WebSocket 连接，也不请求 Token 接口，避免加重 RGV587 惩罚。
         """
+        if self._chat_auth_blocked():
+            return 300
         backoff = self._get_active_password_login_failure_backoff()
         if not backoff:
             return 0
@@ -975,6 +1109,8 @@ class XianyuLive:
 
     def _should_skip_token_refresh_for_login_backoff(self, current_time: Optional[float] = None) -> bool:
         """在需要人工介入或明确退避期间，直接跳过 token 预检，避免重复打到平台。"""
+        if self._chat_auth_blocked():
+            return True
         current_time = current_time or time.time()
         failure_backoff = self._get_active_password_login_failure_backoff(current_time)
         if not failure_backoff:
@@ -1496,6 +1632,8 @@ class XianyuLive:
 
     def _set_connection_state(self, new_state: ConnectionState, reason: str = ""):
         """设置连接状态并记录日志"""
+        if new_state != ConnectionState.CONNECTED:
+            self.chat_ready = False
         if self.connection_state != new_state:
             old_state = self.connection_state
             self.connection_state = new_state
@@ -1913,7 +2051,7 @@ class XianyuLive:
     def _calculate_retry_delay(self, error_msg: str) -> int:
         """根据错误类型和失败次数计算重试延迟"""
         current_time = time.time()
-        if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+        if self._chat_auth_blocked() or self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
             return max(300, self._compute_token_retry_wait_seconds(current_time))
 
         if self._is_in_qr_login_grace_period(current_time):
@@ -2116,8 +2254,27 @@ class XianyuLive:
 
         self.cookie_id = cookie_id  # 唯一账号标识
         self.cookies_str = cookies_str  # 保存原始cookie字符串
+        self._persisted_cookie_value = cookies_str
         self.user_id = user_id  # 保存用户ID，用于token刷新时保持正确的所有者关系
         self.register_instance = bool(register_instance)
+        self._chat_auth_generation = self._chat_auth_generations.get(cookie_id, 0)
+        self._auth_superseded = False
+        self.chat_ready = False
+        self._ready_websockets = set()
+        self._pending_chat_frames = {}
+        self._deferred_chat_frames = []
+        self._chat_recovery_pending = False
+        self._chat_recovery_in_progress = False
+        self._chat_recovery_deadline = None
+        self.chat_verification_required = db_manager.get_chat_verification_required(cookie_id)
+        if self.register_instance:
+            handoff = self.consume_chat_handoff(cookie_id, cookies_str)
+            if handoff:
+                if not db_manager.set_chat_verification_required(cookie_id, False, expected_cookie=cookies_str):
+                    raise ValueError('聊天凭证交接未落库，停止恢复')
+                self.chat_verification_required = False
+                self._chat_recovery_pending = True
+                self._chat_recovery_deadline = handoff['deadline']
         self.base_url = WEBSOCKET_URL
 
         if 'unb' not in self.cookies:
@@ -2172,7 +2329,8 @@ class XianyuLive:
         self.message_stream_notification_cooldown = max(self.message_stream_watchdog_timeout, 1800)
 
         prewarmed_token_info = self.pop_auth_prewarmed_token(self.cookie_id)
-        if prewarmed_token_info:
+        if (prewarmed_token_info and not self.chat_verification_required
+                and prewarmed_token_info.get('fingerprint') == hashlib.sha256(self.cookies_str.encode()).hexdigest()):
             self.current_token = prewarmed_token_info.get('token')
             self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
             logger.info(
@@ -2356,7 +2514,7 @@ class XianyuLive:
     def _unregister_instance(self):
         """从类级别字典中注销当前实例"""
         try:
-            if self.cookie_id in XianyuLive._instances:
+            if XianyuLive._instances.get(self.cookie_id) is self:
                 del XianyuLive._instances[self.cookie_id]
                 logger.warning(f"【{self.cookie_id}】实例已从全局字典中注销")
         except Exception as e:
@@ -8661,6 +8819,8 @@ class XianyuLive:
 
             account_info = db_manager.get_cookie_details(self.cookie_id)
             new_cookies_str = self._extract_cookie_value(account_info)
+            if new_cookies_str:
+                self._persisted_cookie_value = new_cookies_str
             if new_cookies_str and new_cookies_str != self.cookies_str:
                 suffix = f" ({reason})" if reason else ""
                 logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie{suffix}")
@@ -8711,13 +8871,16 @@ class XianyuLive:
         cookies_dict: Optional[Dict[str, Any]] = None,
         source: str = "runtime_update",
     ) -> bool:
+        if not self._chat_auth_is_current():
+            return False
         changed = self._set_runtime_cookie_state(
             cookies_str=cookies_str,
             cookies_dict=cookies_dict,
             source=source,
         )
         if changed:
-            await self.update_config_cookies()
+            if await self.update_config_cookies() is False:
+                return False
             self._schedule_pending_platform_confirm_retry(f"Cookie更新:{source}")
         return changed
 
@@ -9045,6 +9208,12 @@ class XianyuLive:
         source: str = 'auth_success',
         proxy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        async with self._chat_auth_recovery() as acquired:
+            if not acquired:
+                return {'status': 'skipped', 'source': source, 'reason': 'chat_auth_paused_or_busy', 'token_cached': False}
+            return await self._soft_preflight_token_after_auth_impl(cookie_string, source, proxy)
+
+    async def _soft_preflight_token_after_auth_impl(self, cookie_string, source, proxy):
         """认证成功后的轻量 token 软预检。
 
         该方法只做观测与 token 预热：网络失败、超时、未知响应都不会阻断既有登录/刷新流程。
@@ -9093,6 +9262,8 @@ class XianyuLive:
                 'token_cached': False,
             }
 
+        if not self._chat_auth_is_current():
+            return {'status': 'skipped', 'source': source, 'reason': 'credentials_changed', 'token_cached': False}
         status = str(probe_result.get('status') or 'unknown')
         verification_url = str(probe_result.get('verification_url') or '').strip()
         token_cached = False
@@ -9104,6 +9275,7 @@ class XianyuLive:
                     self.cookie_id,
                     access_token,
                     source=f'soft_preflight:{normalized_source}',
+                    cookies_str=target_cookie_string,
                 )
                 token_cached = True
             logger.info(
@@ -9111,8 +9283,10 @@ class XianyuLive:
                 f"{'，已缓存预热token' if token_cached else ''}"
             )
         elif status == 'verification_required':
+            if target_cookie_string == self.cookies_str:
+                await self._pause_chat_for_verification('soft_token_preflight')
             logger.warning(
-                f"【{self.cookie_id}】{normalized_source}软Token预检返回验证要求，不阻断原流程: {verification_url or '无URL'}"
+                f"【{self.cookie_id}】{normalized_source}软Token预检返回验证要求，已暂停聊天认证"
             )
         else:
             logger.warning(
@@ -9180,7 +9354,7 @@ class XianyuLive:
         for attempt in range(1, max_preflight_retries + 1):
             token = await self.refresh_token(allow_password_login_recovery=False)
             if token:
-                self.cache_auth_prewarmed_token(self.cookie_id, token, source='manual_refresh_handoff')
+                self.cache_auth_prewarmed_token(self.cookie_id, token, source='manual_refresh_handoff', cookies_str=self.cookies_str)
                 logger.info(f"【{self.cookie_id}】手动刷新后的Token预检成功（第{attempt}次），已缓存预热token供新实例复用")
                 return token
 
@@ -9195,10 +9369,14 @@ class XianyuLive:
         raise InitAuthError(f"手动刷新后的Token预检失败，状态: {self.last_token_refresh_status or 'unknown'}")
 
     async def refresh_token(self, captcha_retry_count: int = 0, allow_password_login_recovery: bool = True):
+        if self._chat_auth_blocked():
+            return None
         if self.token_refresh_lock.locked():
             logger.info(f"【{self.cookie_id}】Token刷新已有执行中任务，等待当前流程完成后复用结果")
 
         async with self.token_refresh_lock:
+            if self._chat_auth_blocked():
+                return None
             dedup_window = max(5, int(RISK_CONTROL.get('token_refresh_dedup_window_seconds', 60) or 60))
             if (
                 captcha_retry_count == 0 and
@@ -9210,10 +9388,13 @@ class XianyuLive:
                 return self.current_token
             if captcha_retry_count == 0 and self._should_skip_token_refresh_for_login_backoff():
                 return None
-            return await self._refresh_token_impl(
-                captcha_retry_count,
-                allow_password_login_recovery=allow_password_login_recovery,
-            )
+            async with self._chat_auth_recovery() as acquired:
+                if not acquired:
+                    return None
+                return await self._refresh_token_impl(
+                    captcha_retry_count,
+                    allow_password_login_recovery=allow_password_login_recovery,
+                )
 
     def _is_auth_failure_ret(self, ret_value: Any) -> bool:
         if isinstance(ret_value, str):
@@ -9239,6 +9420,14 @@ class XianyuLive:
 
     async def keep_session_alive(self) -> bool:
         """使用 loginuser.get 轻量维持网页登录态。"""
+        if self._chat_auth_blocked():
+            return False
+        async with self._chat_auth_recovery() as acquired:
+            if not acquired:
+                return False
+            return await self._keep_session_alive_impl()
+
+    async def _keep_session_alive_impl(self) -> bool:
         self.last_session_keepalive_status = "started"
         self.last_session_keepalive_error_message = None
 
@@ -9295,6 +9484,11 @@ class XianyuLive:
                     logger.warning(f"【{self.cookie_id}】轻量保活响应解析失败: {response_text[:200]}")
                     return False
 
+                if not self._chat_auth_is_current():
+                    return False
+                if self._need_captcha_verification(res_json):
+                    await self._pause_chat_for_verification('session_keepalive')
+                    return False
                 await self._apply_response_cookie_updates(response.headers, "session_keepalive")
                 ret_value = res_json.get('ret', [])
                 if any('SUCCESS::调用成功' in str(ret) for ret in ret_value):
@@ -9337,6 +9531,8 @@ class XianyuLive:
         Args:
             captcha_retry_count: 滑块验证重试次数，用于防止无限递归
         """
+        if self._chat_auth_blocked():
+            return None
         # 初始化通知发送标志，避免重复发送通知
         notification_sent = False
         
@@ -9473,6 +9669,8 @@ class XianyuLive:
                             f"仅用于本次恢复链路，不提前写入数据库"
                         )
 
+                    if not self._chat_auth_is_current():
+                        return None
                     if isinstance(res_json, dict):
                         ret_value = res_json.get('ret', [])
                         # 检查ret是否包含成功信息
@@ -9489,7 +9687,8 @@ class XianyuLive:
                                 # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
                                 self.last_message_received_time = 0
                                 logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
-                                self._clear_qr_login_grace_period()
+                                if not getattr(self, "_chat_recovery_in_progress", False):
+                                    self._clear_qr_login_grace_period()
                                 self.clear_init_auth_failure_state(self.cookie_id)
                                 self.last_init_failure_reason = None
                                 self.last_init_failure_type = None
@@ -9509,291 +9708,9 @@ class XianyuLive:
 
                     # 检查是否需要滑块验证
                     if self._need_captcha_verification(res_json):
-                        qr_login_grace = self.get_qr_login_grace(self.cookie_id)
-                        if qr_login_grace and not qr_login_grace.get('captcha_buffer_used'):
-                            logger.warning(f"【{self.cookie_id}】扫码登录后的首轮Token刷新命中风控，执行一次浏览器侧Cookie稳定化后进入稳定期退避，避免继续挤爆")
-                            log_captcha_event(
-                                self.cookie_id,
-                                "扫码登录首轮Token刷新命中风控，执行浏览器侧稳定化后退避",
-                                None,
-                                f"触发场景: Token刷新, ret={res_json.get('ret', [])}"
-                            )
-                            self.update_qr_login_grace(
-                                self.cookie_id,
-                                captcha_buffer_used=True,
-                                captcha_detected_at=time.time()
-                            )
-                            await asyncio.sleep(2)
-                            stabilization_success = await self._refresh_cookies_via_browser_page(
-                                transient_recovery_cookies_str,
-                                restart_on_success=False
-                            )
-                            if stabilization_success:
-                                self.update_qr_login_grace(
-                                    self.cookie_id,
-                                    browser_stabilized=True,
-                                    browser_stabilized_at=time.time()
-                                )
-                                logger.info(f"【{self.cookie_id}】浏览器侧Cookie稳定化完成；不立即重试Token，等待扫码登录稳定期结束后再恢复")
-                            else:
-                                logger.warning(f"【{self.cookie_id}】浏览器侧Cookie稳定化未消除风控；不继续进入滑块验证，等待扫码登录稳定期结束后再恢复")
-
-                            remaining = self._get_qr_login_grace_remaining_seconds()
-                            self.last_token_refresh_status = "qr_login_grace_wait"
-                            self.last_token_refresh_error_message = f"扫码登录后Token预检命中风控，已进入稳定期退避，剩余{remaining}秒"
-                            return None
-
-                        manual_refresh_state = self.get_manual_refresh_state(self.cookie_id)
-                        is_manual_refresh_handoff = bool(
-                            manual_refresh_state and manual_refresh_state.get('phase') == 'handoff_recovery'
-                        )
-                        if is_manual_refresh_handoff and not manual_refresh_browser_stabilization_used:
-                            logger.warning(f"【{self.cookie_id}】手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧Cookie稳定化")
-                            log_captcha_event(
-                                self.cookie_id,
-                                "手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧稳定化",
-                                None,
-                                f"触发场景: Token刷新, ret={res_json.get('ret', [])}"
-                            )
-                            before_x5_snapshot = self._build_x5_cookie_snapshot(cookie_string=transient_recovery_cookies_str)
-                            self._log_x5_cookie_snapshot("手动刷新交接稳定化前的x5票据", cookie_string=transient_recovery_cookies_str)
-                            self.last_token_refresh_status = "manual_refresh_browser_stabilizing"
-                            stabilization_success = await self._refresh_cookies_via_browser_page(
-                                transient_recovery_cookies_str,
-                                restart_on_success=False
-                            )
-                            if stabilization_success:
-                                self._reload_latest_cookies_from_db("手动刷新交接阶段浏览器稳定化")
-                                after_x5_snapshot = self._build_x5_cookie_snapshot()
-                                self._log_x5_cookie_snapshot("手动刷新交接稳定化后的x5票据")
-                                changed_x5_fields = [
-                                    key for key in ('x5sec', 'x5secdata')
-                                    if before_x5_snapshot.get(key, {}).get('hash') != after_x5_snapshot.get(key, {}).get('hash')
-                                ]
-                                if changed_x5_fields:
-                                    logger.info(
-                                        f"【{self.cookie_id}】手动刷新交接阶段浏览器稳定化已更新x5票据: {', '.join(changed_x5_fields)}"
-                                    )
-                                else:
-                                    logger.info(f"【{self.cookie_id}】手动刷新交接阶段浏览器稳定化未观察到x5票据变化，继续重试Token预检")
-                                return await self._refresh_token_impl(
-                                    captcha_retry_count,
-                                    post_slider_session_grace_used=post_slider_session_grace_used,
-                                    allow_password_login_recovery=allow_password_login_recovery,
-                                    manual_refresh_browser_stabilization_used=True,
-                                    post_slider_session_retry_count=post_slider_session_retry_count,
-                                )
-                            logger.warning(f"【{self.cookie_id}】手动刷新交接阶段浏览器稳定化失败，继续进入滑块验证")
-
-                        if self.is_manual_refresh_active(self.cookie_id, allow_handoff_recovery=True):
-                            logger.warning(f"【{self.cookie_id}】检测到手动刷新进行中，跳过自动滑块处理")
-                            log_captcha_event(
-                                self.cookie_id,
-                                "手动刷新进行中，跳过自动滑块处理",
-                                None,
-                                "触发场景: Token刷新"
-                            )
-                            self.last_token_refresh_status = "manual_refresh_active"
-                            self._clear_pending_slider_success_notice("手动刷新进行中")
-                            notification_sent = True
-                            return None
-
-                        logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
-
-                        # 记录滑块验证检测到日志文件
-                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
-                        log_captcha_event(self.cookie_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
-                        captcha_trigger_scene = 'token_refresh'
-                        captcha_session_id = self._new_risk_session_id('slider')
-                        captcha_event_meta = self._build_risk_event_meta(
-                            trigger_scene=captcha_trigger_scene,
-                            verification_url=verification_url,
-                            extra={'cookie_id': self.cookie_id}
-                        )
-
-                        # 添加风控日志记录
-                        log_id = None
-                        try:
-                            log_id = self._create_risk_log(
-                                event_type='slider_captcha',
-                                session_id=captcha_session_id,
-                                trigger_scene=captcha_trigger_scene,
-                                result_code='slider_captcha_detected',
-                                event_description='检测到滑块验证（Token刷新）',
-                                processing_status='processing',
-                                event_meta=captcha_event_meta,
-                            )
-                            if log_id:
-                                logger.info(f"【{self.cookie_id}】风控日志记录成功，ID: {log_id}")
-                        except Exception as log_e:
-                            logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
-
-                        from utils.xianyu_slider_stealth import HardBlockCircuitError, feedback_is_hard_block
-                        try:
-                            # 尝试通过滑块验证获取新的cookies
-                            captcha_start_time = time.time()
-                            if feedback_is_hard_block(res_json):
-                                raise HardBlockCircuitError("检测到 pureCaptcha/RGV587 硬拦截，停止自动滑块")
-                            new_cookies_str = await self._handle_captcha_verification(res_json)
-                            captcha_duration = time.time() - captcha_start_time
-                            if self.last_token_refresh_status == "captcha_recovery_disabled":
-                                if 'log_id' in locals() and log_id:
-                                    self._update_risk_log(
-                                        log_id,
-                                        session_id=captcha_session_id,
-                                        trigger_scene=captcha_trigger_scene,
-                                        result_code='captcha_recovery_disabled',
-                                        processing_result='自动滑块恢复已关闭，未启动浏览器',
-                                        processing_status='failed',
-                                        error_message=self.last_token_refresh_error_message or '自动滑块恢复已关闭',
-                                        duration_ms=max(0, int(captcha_duration * 1000)),
-                                        event_meta=self._build_risk_event_meta(
-                                            trigger_scene=captcha_trigger_scene,
-                                            verification_url=verification_url,
-                                            extra={'cookie_id': self.cookie_id},
-                                        ),
-                                    )
-                                notification_sent = True
-                                return None
-
-                            if new_cookies_str:
-                                logger.info(f"【{self.cookie_id}】滑块验证成功，准备重启实例...")
-
-                                # 更新风控日志为成功状态
-                                if 'log_id' in locals() and log_id:
-                                    self._update_risk_log(
-                                        log_id,
-                                        session_id=captcha_session_id,
-                                        trigger_scene=captcha_trigger_scene,
-                                        result_code='slider_captcha_success',
-                                        captcha_engine=getattr(self, 'last_slider_captcha_engine', None),
-                                        processing_result='滑块验证成功，已获取新Cookie',
-                                        processing_status='success',
-                                        duration_ms=max(0, int(captcha_duration * 1000)),
-                                        event_meta=self._build_risk_event_meta(
-                                            trigger_scene=captcha_trigger_scene,
-                                            verification_url=verification_url,
-                                            extra={
-                                                'cookie_id': self.cookie_id,
-                                                'cookie_length': len(new_cookies_str),
-                                                'captcha_engine': getattr(self, 'last_slider_captcha_engine', None),
-                                            },
-                                        ),
-                                    )
-
-                                # 重启实例（cookies已在_handle_captcha_verification中更新到数据库）
-                                # await self._restart_instance()
-
-                                # 给浏览器回写票据与数据库落盘留一个稳定窗口，避免刚过块就立即重新命中Session过期
-                                settle_delay = random.uniform(*self.post_slider_token_retry_delay)
-                                logger.info(
-                                    f"【{self.cookie_id}】滑块成功后进入稳定窗口 {settle_delay:.2f}s，再重新尝试Token刷新"
-                                )
-                                await asyncio.sleep(settle_delay)
-                                self._reload_latest_cookies_from_db("滑块成功后的稳定窗口")
-                                log_captcha_event(
-                                    self.cookie_id,
-                                    "滑块成功后重新进入Token刷新",
-                                    None,
-                                    f"类型: token_reentry_after_slider_success, captcha_retry_count={captcha_retry_count + 1}"
-                                )
-
-                                # 重新尝试刷新token（递归调用，但有深度限制）
-                                return await self._refresh_token_impl(
-                                    captcha_retry_count + 1,
-                                    post_slider_session_grace_used=False,
-                                    allow_password_login_recovery=allow_password_login_recovery,
-                                    manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
-                                    post_slider_session_retry_count=0,
-                                )
-                            else:
-                                logger.error(f"【{self.cookie_id}】滑块验证失败")
-                                XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
-                                self.last_token_refresh_error_message = "滑块验证失败，未获取到新Cookie"
-                                logger.warning(f"【{self.cookie_id}】已进入滑块失败退避期: slider_failed, 600秒")
-
-                                # 更新风控日志为失败状态
-                                if 'log_id' in locals() and log_id:
-                                    self._update_risk_log(
-                                        log_id,
-                                        session_id=captcha_session_id,
-                                        trigger_scene=captcha_trigger_scene,
-                                        result_code='slider_captcha_failed',
-                                        captcha_engine=getattr(self, 'last_slider_captcha_engine', None),
-                                        processing_result=getattr(self, 'last_slider_result_message', None) or '滑块验证失败，未获取到新Cookie',
-                                        processing_status='failed',
-                                        error_message=getattr(self, 'last_slider_result_message', None) or '未获取到新Cookie',
-                                        duration_ms=max(0, int(captcha_duration * 1000)),
-                                        event_meta=self._build_risk_event_meta(
-                                            trigger_scene=captcha_trigger_scene,
-                                            verification_url=verification_url,
-                                            extra={
-                                                'cookie_id': self.cookie_id,
-                                                'captcha_engine': getattr(self, 'last_slider_captcha_engine', None),
-                                                'failure_message': getattr(self, 'last_slider_result_message', None),
-                                            },
-                                        ),
-                                    )
-                                
-                                # 标记已处理，避免后续再发送通用失败通知
-                                notification_sent = True
-                        except HardBlockCircuitError as captcha_e:
-                            hard_block_seconds = int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600)
-                            XianyuLive.set_password_login_failure_backoff(
-                                self.cookie_id, 'hard_block', hard_block_seconds
-                            )
-                            self.last_token_refresh_status = "hard_block"
-                            self.last_token_refresh_error_message = self._safe_str(captcha_e)
-                            logger.error(
-                                f"【{self.cookie_id}】命中 pureCaptcha/RGV587 硬拦截，停止自动滑块并冷却 {hard_block_seconds} 秒"
-                            )
-                            captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
-                            if 'log_id' in locals() and log_id:
-                                self._update_risk_log(
-                                    log_id,
-                                    session_id=captcha_session_id,
-                                    trigger_scene=captcha_trigger_scene,
-                                    result_code='hard_block',
-                                    processing_result='pureCaptcha/RGV587 硬拦截，已停止自动滑块',
-                                    processing_status='failed',
-                                    error_message=self._safe_str(captcha_e)[:200],
-                                    duration_ms=max(0, int(captcha_duration * 1000)),
-                                    event_meta=self._build_risk_event_meta(
-                                        trigger_scene=captcha_trigger_scene,
-                                        verification_url=verification_url,
-                                        extra={'cookie_id': self.cookie_id},
-                                    ),
-                                )
-                            notification_sent = True
-                            return None
-                        except Exception as captcha_e:
-                            logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
-                            self._clear_pending_slider_success_notice("滑块验证处理异常")
-                            XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
-                            self.last_token_refresh_error_message = self._safe_str(captcha_e)
-                            logger.warning(f"【{self.cookie_id}】滑块验证异常后进入退避期: slider_failed, 600秒")
-
-                            # 更新风控日志为异常状态
-                            captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
-                            if 'log_id' in locals() and log_id:
-                                self._update_risk_log(
-                                    log_id,
-                                    session_id=captcha_session_id,
-                                    trigger_scene=captcha_trigger_scene,
-                                    result_code='slider_captcha_exception',
-                                    processing_result='滑块验证处理异常',
-                                    processing_status='failed',
-                                    error_message=str(captcha_e)[:200],
-                                    duration_ms=max(0, int(captcha_duration * 1000)),
-                                    event_meta=self._build_risk_event_meta(
-                                        trigger_scene=captcha_trigger_scene,
-                                        verification_url=verification_url,
-                                        extra={'cookie_id': self.cookie_id},
-                                    ),
-                                )
-                            
-                            # 标记已处理，避免后续再发送通用失败通知
-                            notification_sent = True
+                        await self._pause_chat_for_verification("token_refresh")
+                        notification_sent = True
+                        return None
 
                     # 检查是否包含"令牌过期"或"Session过期"
                     if isinstance(res_json, dict):
@@ -10007,54 +9924,15 @@ class XianyuLive:
             return None
 
     def _need_captcha_verification(self, res_json: dict) -> bool:
-        """检查响应是否需要滑块验证"""
-        try:
-            if not isinstance(res_json, dict):
-                return False
-
-            # 记录res_json内容到日志文件
-            import json
-            res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-            log_captcha_event(self.cookie_id, "检查滑块验证响应", None, f"res_json内容: {res_json_str}")
-
-            # 检查返回的错误信息
-            ret_value = res_json.get('ret', [])
-            if not ret_value:
-                return False
-
-            # 检查是否包含需要验证的关键词
-            captcha_keywords = [
-                'FAIL_SYS_USER_VALIDATE',  # 用户验证失败
-                'RGV587_ERROR',            # 风控错误
-                '哎哟喂,被挤爆啦',          # 被挤爆了
-                '哎哟喂，被挤爆啦',         # 被挤爆了（中文逗号）
-                '挤爆了',                  # 挤爆了
-                '请稍后重试',              # 请稍后重试
-                'punish?x5secdata',        # 惩罚页面
-                'captcha',                 # 验证码
-            ]
-
-            error_msg = str(ret_value[0]) if ret_value else ''
-
-            # 检查错误信息是否包含需要验证的关键词
-            for keyword in captcha_keywords:
-                if keyword in error_msg:
-                    logger.info(f"【{self.cookie_id}】检测到需要滑块验证的关键词: {keyword}")
-                    return True
-
-            # 检查data字段中是否包含验证URL
-            data = res_json.get('data', {})
-            if isinstance(data, dict) and 'url' in data:
-                url = data.get('url', '')
-                if 'punish' in url or 'captcha' in url or 'validate' in url:
-                    logger.info(f"【{self.cookie_id}】检测到验证URL: {url}")
-                    return True
-
+        if not isinstance(res_json, dict):
             return False
-
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】检查是否需要滑块验证时出错: {self._safe_str(e)}")
-            return False
+        ret = res_json.get('ret') or []
+        ret_text = ret if isinstance(ret, str) else ' | '.join(map(str, ret))
+        if any(marker in ret_text for marker in ('FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR')):
+            return True
+        data = res_json.get('data') or {}
+        url = str(data.get('url') or '') if isinstance(data, dict) else ''
+        return any(marker in url.lower() for marker in ('punish', 'captcha', 'validate'))
 
     async def _probe_token_request_outbound_ip(self) -> Optional[str]:
         """探测当前 Token HTTP 链路的出口 IP；失败时放行，不阻断原流程。"""
@@ -10088,6 +9966,8 @@ class XianyuLive:
 
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
+        if self._chat_auth_blocked():
+            return None
         try:
             logger.info(f"【{self.cookie_id}】开始处理滑块验证...")
 
@@ -10448,6 +10328,8 @@ class XianyuLive:
 
     async def update_config_cookies(self):
         """更新数据库中的cookies（不会覆盖账号密码等其他字段）"""
+        if not self._chat_auth_is_current():
+            return False
         try:
             from db_manager import db_manager
 
@@ -10464,13 +10346,16 @@ class XianyuLive:
                     success = db_manager.update_cookie_account_info(
                         self.cookie_id, 
                         cookie_value=self.cookies_str,
-                        user_id=current_user_id  # 如果是新账号，需要提供user_id
+                        user_id=current_user_id,
+                        expected_cookie=getattr(self, '_persisted_cookie_value', None),
                     )
                     if not success:
                         # 如果更新失败，记录错误但不使用 save_cookie（避免覆盖账号密码）
                         logger.warning(f"更新Cookie到数据库失败: {self.cookie_id}，但不使用save_cookie避免覆盖账号密码")
                     else:
+                        self._persisted_cookie_value = self.cookies_str
                         logger.warning(f"已更新Cookie到数据库: {self.cookie_id}")
+                    return bool(success)
                 except Exception as e:
                     logger.error(f"更新数据库Cookie失败: {self._safe_str(e)}")
                     # 发送数据库更新失败通知
@@ -10484,6 +10369,7 @@ class XianyuLive:
             logger.error(f"更新Cookie失败: {self._safe_str(e)}")
             # 发送Cookie更新失败通知
             await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
+        return False
 
     async def _try_password_login_refresh(
         self,
@@ -10523,6 +10409,9 @@ class XianyuLive:
             'inconclusive': False,
             'relogin_recommended': True,
         }
+        if self._chat_auth_blocked():
+            result.update(valid=False, inconclusive=True, relogin_recommended=False, details='聊天认证已暂停或凭证已交接')
+            return result
         
         # 1. 测试确认发货API - 使用测试订单ID实际调用
         # try:
@@ -14718,7 +14607,7 @@ class XianyuLive:
                         break
 
                     current_time = time.time()
-                    if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+                    if self._chat_auth_blocked() or self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
                         logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，暂停会话保活循环")
                         await self._interruptible_sleep(300)
                         continue
@@ -14787,6 +14676,7 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】Token刷新循环已退出")
 
     async def create_chat(self, ws, toid, item_id='891198795482'):
+        self._require_chat_ready(ws)
         msg = {
             "lwp": "/r/SingleChatConversation/create",
             "headers": {
@@ -14811,6 +14701,7 @@ class XianyuLive:
 
     async def send_msg(self, ws, cid, toid, text):
         """发送一条私聊文本，并等待这条 mid 的服务端成功回执。未确认送达则抛错，调用方不得点发货。"""
+        self._require_chat_ready(ws)
         text_payload = {
             "contentType": 1,
             "text": {
@@ -14872,6 +14763,7 @@ class XianyuLive:
 
     async def _await_lwp_ack_on_shared_socket(self, ws, mid: str, raw_message: str, timeout: float = None):
         """主连接的回执由接收循环写入 lwp_response_waiters，发送协程只等自己的 mid。"""
+        self._require_chat_ready(ws)
         wait_timeout = SEND_ACK_TIMEOUT_SECONDS if timeout is None else timeout
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -14888,6 +14780,7 @@ class XianyuLive:
 
     async def _await_lwp_ack_on_dedicated_socket(self, ws, mid: str, raw_message: str, timeout: float = None):
         """独立连接没有主接收循环。发送后必须自己读，直到对上 mid，否则会和外层 async for 互相等死。"""
+        self._require_chat_ready(ws)
         wait_timeout = SEND_ACK_TIMEOUT_SECONDS if timeout is None else timeout
         await ws.send(raw_message)
         deadline = time.monotonic() + wait_timeout
@@ -14913,6 +14806,29 @@ class XianyuLive:
             return message_data
 
     async def init(self, ws):
+        if self._chat_auth_blocked():
+            raise InitAuthError('聊天正在等待平台验证或凭证已交接')
+        controlled_recovery = bool(getattr(self, '_chat_recovery_pending', False))
+        self._chat_recovery_pending = False
+        deadline = getattr(self, '_chat_recovery_deadline', None) if controlled_recovery else None
+        timeout = min(30.0, deadline - time.time()) if deadline else 30.0
+        try:
+            if timeout <= 0:
+                raise asyncio.TimeoutError()
+            await asyncio.wait_for(self._initialize_chat(ws, controlled_recovery), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            self.last_init_failure_type = 'chat_ready_timeout'
+            self.last_init_failure_reason = '聊天初始化在30秒内未完成'
+            self.last_token_refresh_status = 'chat_ready_timeout'
+            self.last_token_refresh_error_message = self.last_init_failure_reason
+            raise InitAuthError(self.last_init_failure_reason) from exc
+        finally:
+            self._chat_recovery_in_progress = False
+            self._chat_recovery_task = None
+
+    async def _initialize_chat(self, ws, controlled_recovery=False):
+        self._chat_recovery_in_progress = controlled_recovery
+        self._chat_recovery_task = asyncio.current_task() if controlled_recovery else None
         # 如果没有token或者token过期，获取新token
         token_refresh_attempted = False
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
@@ -14935,11 +14851,9 @@ class XianyuLive:
                 logger.info(f"【{self.cookie_id}】由于刚刚尝试过token刷新，跳过重复的初始化失败通知")
             raise InitAuthError(f"Token获取失败(status={self.last_init_failure_reason})")
 
-        self.last_init_failure_type = None
-        self.last_init_failure_reason = None
-        self.clear_init_auth_failure_state(self.cookie_id)
-        self.init_auth_failures = 0
-
+        if self._chat_auth_blocked():
+            raise InitAuthError('聊天认证已暂停')
+        registration_mid = generate_mid()
         msg = {
             "lwp": "/reg",
             "headers": {
@@ -14951,11 +14865,10 @@ class XianyuLive:
                 "wv": "im:3,au:3,sy:6",
                 "sync": "0,0;0;0;",
                 "did": self.device_id,
-                "mid": generate_mid()
+                "mid": registration_mid
             }
         }
         await ws.send(json.dumps(msg))
-        await asyncio.sleep(1)
         current_time = int(time.time() * 1000)
         msg = {
             "lwp": "/r/SyncStatus/ackDiff",
@@ -14974,7 +14887,51 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
-        logger.info(f'【{self.cookie_id}】连接注册完成')
+        pending_frames = self._pending_chat_frames.setdefault(ws, [])
+        registered = False
+        business_ready = False
+        while not (registered and business_ready):
+            raw_frame = await ws.recv()
+            message = json.loads(raw_frame)
+            if not isinstance(message, dict):
+                continue
+            headers = message.get('headers') or {}
+            if str(headers.get('mid') or '') == registration_mid:
+                if not _send_ack_is_success(message):
+                    if self._need_captcha_verification(message):
+                        await self._pause_chat_for_verification('chat_registration')
+                    raise InitAuthError('聊天注册被拒绝')
+                registered = True
+                continue
+            if message.get('lwp'):
+                await self._ack_lwp_message(ws, message)
+                if message.get('lwp') == '/s/vulcan':
+                    business_ready = True
+                else:
+                    pending_frames.append(raw_frame)
+        if self._chat_auth_blocked():
+            raise InitAuthError('聊天凭证在初始化期间已变化')
+        self._ready_websockets.add(ws)
+        if ws is self.ws:
+            self.chat_ready = True
+        self.last_init_failure_type = None
+        self.last_init_failure_reason = None
+        self.clear_init_auth_failure_state(self.cookie_id)
+        self.init_auth_failures = 0
+        logger.info(f'【{self.cookie_id}】聊天注册已确认，业务通道就绪')
+
+    async def _receive_chat_frames(self, ws):
+        if ws is self.ws:
+            self._deferred_chat_frames.extend(self._pending_chat_frames.pop(ws, []))
+            pending = self._deferred_chat_frames
+        else:
+            pending = self._pending_chat_frames.setdefault(ws, [])
+        # 已确认的早到推送在交给处理链前不能因重连被丢弃。
+        while pending:
+            yield pending[0]
+            pending.pop(0)
+        async for frame in ws:
+            yield frame
 
     async def _ack_lwp_message(self, ws, message: dict) -> None:
         try:
@@ -15619,7 +15576,7 @@ class XianyuLive:
                         continue
 
                     current_time = time.time()
-                    if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+                    if self._chat_auth_blocked() or self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
                         logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，跳过自动Cookie刷新")
                         await self._interruptible_sleep(300)
                         continue
@@ -15673,7 +15630,15 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】Cookie刷新循环已退出")
 
     async def _execute_cookie_refresh(self, current_time):
+        async with self._chat_auth_recovery() as acquired:
+            if not acquired:
+                return None
+            return await self._execute_cookie_refresh_impl(current_time)
+
+    async def _execute_cookie_refresh_impl(self, current_time):
         """独立执行Cookie刷新任务，避免阻塞主循环"""
+        if self._chat_auth_blocked():
+            return None
 
         # 使用Lock确保原子性，防止重复执行
         async with self.cookie_refresh_lock:
@@ -15694,16 +15659,16 @@ class XianyuLive:
 
                 # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
                 success = await asyncio.wait_for(
-                    self._refresh_cookies_via_browser(),
+                    self._refresh_cookies_via_browser_impl(),
                     timeout=180.0  # 3分钟超时，减少对WebSocket的影响
                 )
 
                 # 重新启动心跳任务
-                if heartbeat_was_running and self.ws and not self.ws.closed:
+                if heartbeat_was_running and self.ws and not self.ws.closed and not self._chat_auth_blocked():
                     logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
                     self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
 
-                if success:
+                if success and not self._chat_auth_blocked():
                     self.last_cookie_refresh_time = current_time
                     logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
                     
@@ -15747,7 +15712,7 @@ class XianyuLive:
                 self.last_cookie_refresh_time = current_time
             finally:
                 # 确保心跳任务恢复（如果WebSocket仍然连接）
-                if (self.ws and not self.ws.closed and
+                if (self.ws and not self.ws.closed and not self._chat_auth_blocked() and
                     (not self.heartbeat_task or self.heartbeat_task.done())):
                     logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
                     self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
@@ -15964,6 +15929,9 @@ class XianyuLive:
                 )
 
             merge_result = self.protected_merge_cookie_dicts(existing_cookies_dict, real_cookies_dict)
+            if str(real_cookies_dict.get('unb') or '') != str(qr_cookies_dict.get('unb') or ''):
+                logger.error(f"【{target_cookie_id}】浏览器凭证与本次扫码账号不一致，放弃保存")
+                return False
             real_cookies_dict = merge_result['merged_cookies_dict']
             if target_cookie_id == self.cookie_id:
                 self._log_protected_merge_event("qr_login_protected_merge", merge_result)
@@ -15984,7 +15952,8 @@ class XianyuLive:
             if merge_result['preserved_protected_fields']:
                 logger.warning(f"【{target_cookie_id}】扫码登录保护性保留关键字段: {', '.join(merge_result['preserved_protected_fields'])}")
             if merge_result['account_switched']:
-                logger.warning(f"【{target_cookie_id}】扫码登录检测到unb变化，按账号切换处理，不保留旧账号Cookie字段")
+                logger.error(f"【{target_cookie_id}】扫码登录凭证不属于目标账号，保留原凭证")
+                return False
 
             missing_required_fields = merge_result['missing_required_fields']
             if missing_required_fields:
@@ -16086,6 +16055,7 @@ class XianyuLive:
 
             # 保存真实Cookie到数据库
             # 检查是否为新账号
+            self.validate_chat_handoff(target_cookie_id, real_cookies_str)
             existing_cookie = db_manager.get_cookie_details(target_cookie_id)
             if existing_cookie:
                 # 现有账号，使用 update_cookie_account_info 避免覆盖其他字段（如 pause_duration, remark 等）
@@ -16104,6 +16074,7 @@ class XianyuLive:
                         cookies_dict=real_cookies_dict,
                         source="qr_login_refresh",
                     )
+                    self._persisted_cookie_value = real_cookies_str
                     logger.info(f"【{target_cookie_id}】已更新当前实例的Cookie信息")
 
                 # 更新扫码登录Cookie刷新时间标志
@@ -16159,6 +16130,12 @@ class XianyuLive:
                 logger.warning(f"【{target_cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
 
     async def _refresh_cookies_via_browser_page(self, current_cookies_str: str, restart_on_success: bool = True):
+        async with self._chat_auth_recovery() as acquired:
+            if not acquired:
+                return False
+            return await self._refresh_cookies_via_browser_page_impl(current_cookies_str, restart_on_success)
+
+    async def _refresh_cookies_via_browser_page_impl(self, current_cookies_str: str, restart_on_success: bool = True):
         """使用当前cookie访问指定页面获取真实cookie并更新
         
         这是令牌过期时的备用刷新方案，类似于refresh_cookies_from_qr_login，
@@ -16171,6 +16148,8 @@ class XianyuLive:
         Returns:
             bool: 成功返回True，失败返回False
         """
+        if self._chat_auth_blocked():
+            return False
         playwright = None
         browser = None
 
@@ -16445,11 +16424,19 @@ class XianyuLive:
         return int(remaining_time)
 
     async def _refresh_cookies_via_browser(self, triggered_by_refresh_token: bool = False):
+        async with self._chat_auth_recovery() as acquired:
+            if not acquired:
+                return False
+            return await self._refresh_cookies_via_browser_impl(triggered_by_refresh_token)
+
+    async def _refresh_cookies_via_browser_impl(self, triggered_by_refresh_token: bool = False):
         """通过浏览器访问指定页面刷新Cookie
 
         Args:
             triggered_by_refresh_token: 是否由refresh_token方法触发，如果是True则设置browser_cookie_refreshed标志
         """
+        if self._chat_auth_blocked():
+            return False
 
         playwright = None
         browser = None
@@ -16875,6 +16862,8 @@ class XianyuLive:
 
     async def send_msg_once(self, toid, item_id, text):
         """单次发送消息（创建新的WebSocket连接）"""
+        if self._chat_auth_blocked():
+            raise InitAuthError("聊天正在等待验证，未建立发送连接")
         headers = self._build_websocket_headers()
 
         logger.info(f"【{self.cookie_id}】开始单次发送消息: toid={toid}, item_id={item_id}")
@@ -16922,6 +16911,8 @@ class XianyuLive:
 
     async def send_delivery_steps_once(self, toid, item_id, delivery_steps):
         """单次发送发货步骤（创建新的WebSocket连接）。"""
+        if self._chat_auth_blocked():
+            raise InitAuthError("聊天正在等待验证，未建立发送连接")
         headers = self._build_websocket_headers()
 
         logger.info(f"【{self.cookie_id}】开始单次发送发货步骤: toid={toid}, item_id={item_id}, steps={len(delivery_steps or [])}")
@@ -16973,7 +16964,7 @@ class XianyuLive:
             timeout = 30
             start_time = time.time()
 
-            async for message in websocket:
+            async for message in self._receive_chat_frames(websocket):
                 try:
                     if time.time() - start_time > timeout:
                         logger.warning(f"【{self.cookie_id}】WebSocket消息等待超时")
@@ -17006,6 +16997,30 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】WebSocket发货步骤处理异常: {self._safe_str(e)}")
             return False
+        finally:
+            self._ready_websockets.discard(websocket)
+            self._pending_chat_frames.pop(websocket, None)
+
+    @asynccontextmanager
+    async def _open_chat_connection(self, headers, timeout):
+        async def open_connection():
+            connector = await self._create_websocket_connection(headers)
+            return connector, await connector.__aenter__()
+
+        try:
+            connector, websocket = await asyncio.wait_for(open_connection(), timeout)
+        except asyncio.TimeoutError as exc:
+            self._chat_recovery_pending = False
+            self.last_token_refresh_status = 'chat_ready_timeout'
+            self.last_token_refresh_error_message = '聊天连接建立超时'
+            raise InitAuthError('聊天连接建立超时') from exc
+        except Exception:
+            self._chat_recovery_pending = False
+            raise
+        try:
+            yield websocket
+        finally:
+            await connector.__aexit__(None, None, None)
 
     async def _create_websocket_connection(self, headers):
         """创建WebSocket连接，兼容不同版本的websockets库，支持代理配置"""
@@ -17133,7 +17148,7 @@ class XianyuLive:
             timeout = 30
             start_time = time.time()
 
-            async for message in websocket:
+            async for message in self._receive_chat_frames(websocket):
                 try:
                     # 检查是否超时
                     if time.time() - start_time > timeout:
@@ -17162,6 +17177,9 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】WebSocket连接处理异常: {self._safe_str(e)}")
             return False
+        finally:
+            self._ready_websockets.discard(websocket)
+            self._pending_chat_frames.pop(websocket, None)
 
     def is_chat_message(self, message):
         """判断是否为用户聊天消息"""
@@ -17919,10 +17937,9 @@ class XianyuLive:
 
             # 如果有回复内容，发送消息
             if reply:
-                # 🔧 拟人化：发送前加随机延迟（秒回+全天候秒回是行为风控画像）。
-                # 夜间窗口(卖家睡觉)拉长到分钟级，白天 2~10 秒
+                # 普通咨询日夜保持秒级响应，发货节奏由独立配置决定。
                 if self._is_in_night_mode_window():
-                    night_range = RISK_CONTROL.get('night_reply_delay_range') or [60, 480]
+                    night_range = RISK_CONTROL.get('night_reply_delay_range') or [2, 10]
                     human_delay = random.uniform(float(night_range[0]), float(night_range[1]))
                 else:
                     human_delay = random.uniform(2.0, 10.0)
@@ -19207,6 +19224,12 @@ class XianyuLive:
                             await self._interruptible_sleep(manual_qr_wait_seconds)
                         continue
 
+                    if (not self.current_token and not self._chat_recovery_pending
+                            and self._get_qr_login_grace_remaining_seconds() > 0):
+                        self._set_connection_state(ConnectionState.RECONNECTING, '扫码后首次恢复未完成，等待后台稳定期')
+                        await self._interruptible_sleep(min(60, self._get_qr_login_grace_remaining_seconds()))
+                        continue
+
                     headers = self._build_websocket_headers()
 
                     # 更新连接状态为连接中
@@ -19214,7 +19237,10 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】WebSocket目标地址: {self.base_url}")
 
                     # 兼容不同版本的websockets库
-                    async with await self._create_websocket_connection(headers) as websocket:
+                    connect_timeout = 30.0
+                    if self._chat_recovery_pending and self._chat_recovery_deadline:
+                        connect_timeout = max(0.01, min(30.0, self._chat_recovery_deadline - time.time()))
+                    async with self._open_chat_connection(headers, connect_timeout) as websocket:
                         self.ws = websocket
                         logger.info(f"【{self.cookie_id}】WebSocket连接建立成功，开始初始化...")
 
@@ -19294,7 +19320,7 @@ class XianyuLive:
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
                             logger.info(f"【{self.cookie_id}】准备进入消息循环...")
 
-                            async for message in websocket:
+                            async for message in self._receive_chat_frames(websocket):
                                 try:
                                     message_data = json.loads(message)
 
@@ -19340,6 +19366,9 @@ class XianyuLive:
                                     logger.error(f"处理消息出错: {self._safe_str(e)}")
                                     continue
                         finally:
+                            self.chat_ready = False
+                            self._ready_websockets.discard(websocket)
+                            self._deferred_chat_frames.extend(self._pending_chat_frames.pop(websocket, []))
                             # 停止消息队列工作协程
                             if self.message_queue_enabled and self.message_queue_running:
                                 logger.info(f"【{self.cookie_id}】正在停止消息队列工作协程...")
@@ -19885,6 +19914,7 @@ class XianyuLive:
 
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
         """发送图片消息"""
+        self._require_chat_ready(ws)
         try:
             # 检查图片URL是否需要上传到CDN
             original_url = image_url

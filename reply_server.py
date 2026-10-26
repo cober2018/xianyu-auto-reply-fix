@@ -4077,6 +4077,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'running': False,
         'connection_state': 'not_running',
         'ws_ready': False,
+        'chat_verification_required': False,
         'session_ready': False,
         'has_current_token': False,
         'message_stream_ready': False,
@@ -4132,6 +4133,13 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     if not cleaned_cid:
         return runtime_status
 
+    runtime_status['chat_verification_required'] = db_manager.get_chat_verification_required(cleaned_cid)
+    if runtime_status['chat_verification_required']:
+        runtime_status['token_refresh_status'] = 'chat_verification_required'
+        runtime_status['token_refresh_error_message'] = '聊天需要完成平台验证，请扫码或更新有效凭证'
+        runtime_status['message_stream_status'] = 'verification_required'
+        runtime_status['message_stream_note'] = runtime_status['token_refresh_error_message']
+
     live_instance = None
     try:
         if cookie_manager.manager:
@@ -4162,6 +4170,11 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     session_transport_ready = bool(session and not getattr(session, 'closed', True))
     token_cached = bool(getattr(live_instance, 'current_token', None))
     token_refresh_status = getattr(live_instance, 'last_token_refresh_status', None)
+    runtime_status['chat_verification_required'] = bool(
+        runtime_status['chat_verification_required'] or getattr(live_instance, 'chat_verification_required', False)
+    )
+    if runtime_status['chat_verification_required']:
+        token_refresh_status = 'chat_verification_required'
     session_keepalive_status = getattr(live_instance, 'last_session_keepalive_status', None)
     heartbeat_response_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_response', 0))
     heartbeat_sent_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_time', 0))
@@ -4221,6 +4234,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     ws_ready = (
         connection_state_value == 'connected'
         and ws_transport_ready
+        and bool(getattr(live_instance, 'chat_ready', False))
+        and not runtime_status['chat_verification_required']
+        and not getattr(live_instance, '_auth_superseded', False)
         and (recent_heartbeat_ok or recent_connection)
     )
     session_ready = (
@@ -4270,10 +4286,13 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         and business_idle_seconds >= message_stream_watchdog_timeout
     )
 
-    if connection_state_value in {'connecting', 'reconnecting'}:
+    if runtime_status['chat_verification_required']:
+        message_stream_status = 'verification_required'
+        message_stream_ready = False
+    elif connection_state_value in {'connecting', 'reconnecting'}:
         message_stream_status = 'recovering'
         message_stream_ready = False
-    elif connection_state_value != 'connected' or not ws_transport_ready:
+    elif not ws_ready:
         message_stream_status = 'connection_unready'
         message_stream_ready = False
     elif stream_stale_now:
@@ -4322,6 +4341,8 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     else:
         message_stream_note_parts.append(sync_note)
     message_stream_note = ' · '.join(message_stream_note_parts)
+    if runtime_status['chat_verification_required']:
+        message_stream_note = '聊天需要完成平台验证，请扫码或更新有效凭证'
 
     manual_browser_status = None
     manual_browser_reason = None
@@ -5397,6 +5418,13 @@ async def _execute_manual_cookie_import(
                 existing_cookie_dict,
                 incoming_cookie_dict or {},
             )
+            if merge_result.get('missing_required_fields'):
+                raise ValueError('手动导入 Cookie 缺少必要会话字段')
+            previous_value = XianyuLive._extract_cookie_value(existing_cookie_info)
+            previous = trans_cookies(previous_value) if previous_value else {}
+            merged = merge_result['merged_cookies_dict']
+            if previous.get('unb') and str(previous['unb']) != str(merged.get('unb')):
+                raise ValueError('手动导入 Cookie 不属于目标账号')
             if merge_result['incoming_missing_protected_fields']:
                 log_with_user(
                     'warning',
@@ -5414,7 +5442,7 @@ async def _execute_manual_cookie_import(
                 )
             return merge_result['merged_cookies_dict']
 
-        def persist_manual_cookie_import_success(merged_cookies_dict: Dict[str, Any], source_label: str):
+        def persist_manual_cookie_import_success(merged_cookies_dict: Dict[str, Any], source_label: str, access_token: str = None):
             if not merged_cookies_dict:
                 raise ValueError(f"手动导入 Cookie {source_label}后未获取到有效 Cookie")
 
@@ -5422,16 +5450,20 @@ async def _execute_manual_cookie_import(
             existing_same_user_cookie = db_manager.get_all_cookies(user_id)
             is_new_account = account_id not in existing_same_user_cookie
             if is_new_account:
-                db_manager.save_cookie(account_id, cookies_str, user_id)
-                if cookie_manager.manager:
-                    cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
+                saved = db_manager.save_cookie(account_id, cookies_str, user_id)
             else:
-                db_manager.update_cookie_account_info(account_id, cookie_value=cookies_str)
-                if cookie_manager.manager:
-                    if account_id in getattr(cookie_manager.manager, 'cookies', {}):
-                        cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
-                    else:
-                        cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
+                saved = db_manager.update_cookie_account_info(account_id, cookie_value=cookies_str)
+            if not saved:
+                raise RuntimeError('有效 Cookie 保存失败，未启动聊天恢复')
+            if access_token:
+                XianyuLive.cache_auth_prewarmed_token(account_id, access_token, source='manual_cookie_import', cookies_str=cookies_str)
+            if not XianyuLive.authorize_chat_handoff(account_id, cookies_str):
+                raise RuntimeError('本次导入已被更新的凭证取代，保持当前账号状态')
+            if cookie_manager.manager:
+                if not is_new_account and account_id in getattr(cookie_manager.manager, 'cookies', {}):
+                    cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
+                else:
+                    cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
 
             _set_manual_cookie_import_session_status(
                 session_id,
@@ -5534,7 +5566,17 @@ async def _execute_manual_cookie_import(
                 )
 
         def run_import():
+            owner = f'manual_cookie_import:{session_id}'
+            acquired = False
             try:
+                deadline = time.monotonic() + 30
+                while not acquired:
+                    acquired, _ = XianyuLive.acquire_auth_recovery_lock(account_id, owner)
+                    if acquired:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('账号正在恢复认证，请等待当前恢复结束后再导入')
+                    time.sleep(0.1)
                 probe_result = probe_cookie_verification_from_cookie(cookie_value, proxy_config)
                 if probe_result.get('status') == 'cookie_valid':
                     merged_cookies_dict = merge_cookie_dicts_for_import(
@@ -5546,7 +5588,8 @@ async def _execute_manual_cookie_import(
                         f"手动导入 Cookie 预检已确认当前 Cookie 直接有效，跳过浏览器验证: {account_id}",
                         current_user,
                     )
-                    persist_manual_cookie_import_success(merged_cookies_dict, '预检直通')
+                    access_token = ((probe_result.get('payload') or {}).get('data') or {}).get('accessToken')
+                    persist_manual_cookie_import_success(merged_cookies_dict, '预检直通', access_token)
                     return
 
                 target_url = probe_result.get('verification_url')
@@ -5578,6 +5621,8 @@ async def _execute_manual_cookie_import(
                 import traceback
                 logger.error(traceback.format_exc())
             finally:
+                if acquired:
+                    XianyuLive.release_auth_recovery_lock(account_id, owner)
                 try:
                     from utils.xianyu_slider_stealth import concurrency_manager
                     concurrency_manager.unregister_instance(account_id, slider_instance)
@@ -6440,6 +6485,9 @@ async def _hot_reload_after_qr_success(
         log_with_user('warning', f"真实Cookie已获取，但任务管理器未初始化，未启动账号任务: {account_id}", current_user)
         return False
 
+    if not XianyuLive.authorize_chat_handoff(account_id, cookie_value):
+        log_with_user('info', f"忽略已被更新凭证取代的扫码回调: {account_id}", current_user)
+        return False
     _clear_login_backoffs_for_qr_success(account_id, current_user)
 
     switch_handle = None
@@ -6460,7 +6508,11 @@ async def _hot_reload_after_qr_success(
             await switch_handle
         except Exception as await_e:
             log_with_user('warning', f"等待扫码后账号任务切换完成时出错: {account_id}, {await_e}", current_user)
+            return False
 
+    persisted_cookie = db_manager.get_cookie(account_id)
+    if persisted_cookie is not None and persisted_cookie != cookie_value:
+        return False
     XianyuLive.clear_class_level_backoffs(account_id)
     XianyuLive.request_post_qr_delivery_patrol(account_id)
     log_with_user('info', f"扫码热重载完成：已二次清退避并登记待发货补发巡检: {account_id}", current_user)
@@ -6576,31 +6628,37 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                 current_user=current_user,
                                 user_id=user_id,
                             )
+                            if task_restarted and db_manager.get_cookie(account_id) != final_cookies:
+                                task_restarted = False
+                                warning_message = '本次扫码已被更新的凭证取代，保持当前账号状态'
                             if task_restarted:
                                 db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
                                 XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
-                                warning_message = f"真实Cookie已获取，账号任务已切换；为降低再次触发风控的概率，将进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token"
+                                warning_message = f"真实Cookie已获取，已提供一次聊天恢复机会；{qr_login_grace_minutes} 分钟稳定期继续限制后台重复认证"
                                 log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as task_switch_e:
-                        db_manager.set_cookie_qr_login_grace_until(account_id, 0)
-                        XianyuLive.clear_qr_login_grace(account_id)
+                        if db_manager.get_cookie(account_id) == final_cookies:
+                            db_manager.set_cookie_qr_login_grace_until(account_id, 0)
+                            XianyuLive.clear_qr_login_grace(account_id)
                         warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
-                    if not task_restarted:
+                    if not task_restarted and db_manager.get_cookie(account_id) != final_cookies:
+                        warning_message = '本次扫码已被更新的凭证取代，保持当前账号状态'
+                    elif not task_restarted:
                         db_manager.set_cookie_qr_login_grace_until(account_id, 0)
                         XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         if is_new_account:
-                            db_manager.delete_cookie(account_id)
+                            db_manager.delete_cookie(account_id, expected_cookie=final_cookies)
                             log_with_user('warning', f"扫码登录未完成切换，已删除临时创建的新账号记录: {account_id}", current_user)
                         elif previous_cookie_value:
-                            db_manager.update_cookie_account_info(account_id, cookie_value=previous_cookie_value)
+                            db_manager.update_cookie_account_info(account_id, cookie_value=previous_cookie_value, expected_cookie=final_cookies)
                             log_with_user('warning', f"扫码登录未完成切换，已回滚现有账号Cookie: {account_id}", current_user)
                         else:
                             log_with_user('warning', f"扫码登录未完成切换，但未找到可回滚的旧Cookie: {account_id}", current_user)
@@ -6610,7 +6668,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         try:
                             if task_restarted:
                                 processing_result = '扫码登录真实Cookie获取成功，账号任务已启动'
-                                processing_result += f'；已进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token'
+                                processing_result += f'；已提供一次聊天恢复机会，{qr_login_grace_minutes} 分钟稳定期抑制后台重复认证'
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
                                     processing_status='success',
@@ -6719,16 +6777,21 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, is_new_account: bool, current_user: Dict[str, Any], error_reason: str) -> Dict[str, Any]:
     """降级处理：当无法获取真实cookie时，保存原始扫码cookie"""
     try:
+        from XianyuAutoAsync import XianyuLive
+        XianyuLive.validate_chat_handoff(account_id, cookies)
         log_with_user('warning', f"降级处理 - 保存原始扫码cookie: {account_id}, 原因: {error_reason}", current_user)
 
         # 保存原始扫码cookie到数据库
         if is_new_account:
-            db_manager.save_cookie(account_id, cookies, user_id)
+            saved = db_manager.save_cookie(account_id, cookies, user_id)
             log_with_user('info', f"降级处理 - 新账号原始cookie已保存: {account_id}", current_user)
         else:
             # 现有账号使用 update_cookie_account_info 避免覆盖其他字段
-            db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
+            saved = db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
             log_with_user('info', f"降级处理 - 现有账号原始cookie已更新: {account_id}", current_user)
+
+        if not saved:
+            raise RuntimeError("扫码 Cookie 保存失败，未启动聊天恢复")
 
         # 添加到或更新cookie_manager：降级保存同样走统一热重载（清退避→切换→二次清退避→登记补发巡检）
         if cookie_manager.manager:
@@ -6758,6 +6821,7 @@ async def refresh_cookies_from_qr_login(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """使用扫码登录获取的cookie访问指定界面获取真实cookie并存入数据库"""
+    risk_log_id = None
     try:
         qr_cookies = request.get('qr_cookies')
         cookie_id = request.get('cookie_id')
@@ -6767,6 +6831,14 @@ async def refresh_cookies_from_qr_login(
 
         if not cookie_id:
             return {'success': False, 'message': '缺少cookie_id'}
+
+        if cookie_id not in db_manager.get_all_cookies(current_user['user_id']):
+            raise HTTPException(status_code=403, detail='无权刷新该账号')
+        from XianyuAutoAsync import XianyuLive
+        previous = trans_cookies(XianyuLive._extract_cookie_value(db_manager.get_cookie_details(cookie_id)) or '')
+        incoming = trans_cookies(qr_cookies)
+        if previous.get('unb') and str(previous['unb']) != str(incoming.get('unb')):
+            return {'success': False, 'message': '扫码凭证不属于目标账号'}
 
         log_with_user('info', f"开始使用扫码cookie刷新真实cookie: {cookie_id}", current_user)
 
@@ -6861,6 +6933,8 @@ async def refresh_cookies_from_qr_login(
                     pass
             return {'success': False, 'message': '获取真实cookie失败'}
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"扫码cookie刷新异常: {str(e)}", current_user)
         # 更新风控日志状态

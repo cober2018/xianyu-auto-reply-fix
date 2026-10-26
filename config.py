@@ -144,8 +144,8 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'auto_delivery_delay_range': [20, 90],
     # 拟人化：夜间窗口内发货延迟拉长(秒)，真人卖家凌晨处理订单更慢；不宜过长以免影响买家体验
     'auto_delivery_night_delay_range': [180, 900],
-    # 拟人化：夜间窗口内自动回复延迟拉长(秒)，模拟卖家睡觉；白天固定 2~10 秒
-    'night_reply_delay_range': [60, 480],
+    # 普通客服夜间保持秒级响应，显式运营配置仍可覆盖
+    'night_reply_delay_range': [2, 10],
     'auto_captcha_recovery_enabled': False,
     # 履约一致性巡检：平台 shipped 但本地无 finalized 的扫描间隔（秒）
     'delivery_gap_scan_interval': 300,

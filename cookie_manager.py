@@ -62,6 +62,7 @@ class CookieManager:
         """在事件循环中启动 XianyuLive.main"""
         logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")
 
+        live = None
         try:
             logger.info(f"【{cookie_id}】正在导入XianyuLive...")
             from XianyuAutoAsync import XianyuLive  # 延迟导入，避免循环
@@ -105,7 +106,8 @@ class CookieManager:
                 pass
         finally:
             # 清理实例引用
-            self.live_instances.pop(cookie_id, None)
+            if self.live_instances.get(cookie_id) is live:
+                self.live_instances.pop(cookie_id, None)
             logger.info(f"【{cookie_id}】_run_xianyu方法执行结束")
             # 确保日志被刷新
             try:
@@ -120,12 +122,20 @@ class CookieManager:
             self._task_locks[cookie_id] = asyncio.Lock()
         
         async with self._task_locks[cookie_id]:
+            persisted_cookie = db_manager.get_cookie(cookie_id)
+            if persisted_cookie is not None and persisted_cookie != cookie_value:
+                logger.warning(f"【{cookie_id}】忽略已过期的凭证启动请求")
+                return
             # 检查是否已存在任务
             if cookie_id in self.tasks:
                 existing_task = self.tasks[cookie_id]
                 # 检查任务是否还在运行
                 if not existing_task.done():
                     logger.warning(f"【{cookie_id}】任务已存在且正在运行，先停止旧任务...")
+                    old_live = self.live_instances.get(cookie_id)
+                    if old_live:
+                        old_live._auth_superseded = True
+                        old_live.chat_ready = False
                     existing_task.cancel()
                     try:
                         await existing_task
@@ -141,6 +151,10 @@ class CookieManager:
                     self.tasks.pop(cookie_id, None)
                     logger.info(f"【{cookie_id}】旧任务已完成，已移除")
             
+            persisted_cookie = db_manager.get_cookie(cookie_id)
+            if persisted_cookie is not None and persisted_cookie != cookie_value:
+                logger.warning(f"【{cookie_id}】忽略已被新凭证取代的启动请求")
+                return
             self.cookies[cookie_id] = cookie_value
             # 保存到数据库，如果没有指定user_id，则保持原有绑定关系
             db_manager.save_cookie(cookie_id, cookie_value, user_id)
@@ -153,6 +167,10 @@ class CookieManager:
                 if cookie_info:
                     actual_user_id = cookie_info.get('user_id')
 
+            self.cookie_status[cookie_id] = db_manager.get_cookie_status(cookie_id)
+            if not self.get_cookie_status(cookie_id):
+                self._complete_disabled_chat_handoff(cookie_id, cookie_value)
+                return
             task = self.loop.create_task(self._run_xianyu(cookie_id, cookie_value, actual_user_id))
             self.tasks[cookie_id] = task
             logger.info(f"已启动账号任务: {cookie_id} (用户ID: {actual_user_id})")
@@ -165,6 +183,10 @@ class CookieManager:
         async with self._task_locks[cookie_id]:
             task = self.tasks.pop(cookie_id, None)
             if task:
+                old_live = self.live_instances.get(cookie_id)
+                if old_live:
+                    old_live._auth_superseded = True
+                    old_live.chat_ready = False
                 task.cancel()
                 try:
                     # 等待任务完全清理，确保资源释放
@@ -184,6 +206,13 @@ class CookieManager:
             # 从数据库删除
             db_manager.delete_cookie(cookie_id)
             logger.info(f"已移除账号: {cookie_id}")
+
+    @staticmethod
+    def _complete_disabled_chat_handoff(cookie_id: str, cookie_value: str):
+        from XianyuAutoAsync import XianyuLive
+        if XianyuLive.consume_chat_handoff(cookie_id, cookie_value):
+            if not db_manager.set_chat_verification_required(cookie_id, False, expected_cookie=cookie_value):
+                raise RuntimeError('停用账号的凭证交接未落库')
 
     # ------------------------ 对外线程安全接口 ------------------------
     def add_cookie(self, cookie_id: str, cookie_value: str, kw_list: Optional[List[Tuple[str, str]]] = None, user_id: int = None):
@@ -231,6 +260,9 @@ class CookieManager:
                 self._task_locks[cookie_id] = asyncio.Lock()
             
             async with self._task_locks[cookie_id]:
+                if not save_to_db and db_manager.get_cookie(cookie_id) != new_value:
+                    logger.warning(f"【{cookie_id}】忽略已过期的凭证切换请求")
+                    return
                 # 获取原有的user_id和关键词
                 original_user_id = None
                 original_keywords = []
@@ -250,6 +282,10 @@ class CookieManager:
                 task = self.tasks.pop(cookie_id, None)
                 if task:
                     logger.info(f"【{cookie_id}】正在停止旧任务...")
+                    old_live = self.live_instances.get(cookie_id)
+                    if old_live:
+                        old_live._auth_superseded = True
+                        old_live.chat_ready = False
                     task.cancel()
                     try:
                         # 等待任务完全清理，确保资源释放
@@ -265,6 +301,9 @@ class CookieManager:
                     logger.info(f"【{cookie_id}】旧任务已停止")
 
                 # 更新Cookie值
+                if not save_to_db and db_manager.get_cookie(cookie_id) != new_value:
+                    logger.warning(f"【{cookie_id}】忽略已被新凭证取代的交接")
+                    return
                 self.cookies[cookie_id] = new_value
                 
                 # 只有在需要时才保存到数据库（避免覆盖其他字段如pause_duration、remark等）
@@ -273,8 +312,12 @@ class CookieManager:
 
                 # 恢复关键词和状态
                 self.keywords[cookie_id] = original_keywords
+                original_status = db_manager.get_cookie_status(cookie_id)
                 self.cookie_status[cookie_id] = original_status
 
+                if not original_status:
+                    self._complete_disabled_chat_handoff(cookie_id, new_value)
+                    return
                 # 重新启动任务
                 task = self.loop.create_task(self._run_xianyu(cookie_id, new_value, original_user_id))
                 self.tasks[cookie_id] = task
@@ -440,4 +483,4 @@ class CookieManager:
 
 
 # 在 Start.py 中会把此变量赋值为具体实例
-manager: Optional[CookieManager] = None 
+manager: Optional[CookieManager] = None

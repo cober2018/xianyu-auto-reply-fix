@@ -302,6 +302,7 @@ build/
 !docs/faq.md
 !docs/release.md
 !docs/rfc/*.md
+!openspec/changes/improve-chat-session-stability/**/*.md
 
 # 临时配置文件
 *.local.yml

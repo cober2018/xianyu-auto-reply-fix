@@ -329,6 +329,7 @@ class DBManager:
                 remark TEXT DEFAULT '',
                 status_note TEXT DEFAULT '',
                 qr_login_grace_until INTEGER DEFAULT 0,
+                chat_verification_required INTEGER NOT NULL DEFAULT 0,
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -1082,6 +1083,9 @@ Cookie数量: {cookie_count}
                 logger.info("添加cookies表的qr_login_grace_until列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN qr_login_grace_until INTEGER DEFAULT 0")
                 logger.info("数据库迁移完成：添加qr_login_grace_until列")
+
+            if 'chat_verification_required' not in cookie_columns:
+                cursor.execute("ALTER TABLE cookies ADD COLUMN chat_verification_required INTEGER NOT NULL DEFAULT 0")
 
             # 检查cookies表是否存在pause_duration列
             if 'pause_duration' not in cookie_columns:
@@ -2302,11 +2306,15 @@ Cookie数量: {cookie_count}
                 return False
 
     
-    def delete_cookie(self, cookie_id: str) -> bool:
+    def delete_cookie(self, cookie_id: str, expected_cookie: str = None) -> bool:
         """从数据库删除Cookie及其关键字"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                if expected_cookie is not None:
+                    row = cursor.execute("SELECT value FROM cookies WHERE id = ?", (cookie_id,)).fetchone()
+                    if not row or self._decrypt_secret(row[0]) != expected_cookie:
+                        return False
                 # 删除关联的关键字
                 self._execute_sql(cursor, "DELETE FROM keywords WHERE cookie_id = ?", (cookie_id,))
                 # 删除Cookie
@@ -2382,7 +2390,8 @@ Cookie数量: {cookie_count}
                 self._execute_sql(cursor, """
                     SELECT id, value, user_id, auto_confirm, remark, status_note,
                            qr_login_grace_until, pause_duration, username, password, show_browser, created_at,
-                           proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
+                           proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass,
+                           chat_verification_required
                     FROM cookies WHERE id = ?
                 """, (cookie_id,))
                 result = cursor.fetchone()
@@ -2408,7 +2417,8 @@ Cookie数量: {cookie_count}
                         'proxy_host': result[13] or '',
                         'proxy_port': result[14] or 0,
                         'proxy_user': result[15] or '',
-                        'proxy_pass': proxy_pass
+                        'proxy_pass': proxy_pass,
+                        'chat_verification_required': bool(result[17]),
                     }
                 return None
             except Exception as e:
@@ -2453,6 +2463,26 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新账号状态文案失败: {e}")
                 return False
+
+    def get_chat_verification_required(self, cookie_id: str) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT chat_verification_required FROM cookies WHERE id = ?", (cookie_id,)
+            ).fetchone()
+            return bool(row and row[0])
+
+    def set_chat_verification_required(self, cookie_id: str, required: bool,
+                                       expected_cookie: str = None) -> bool:
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM cookies WHERE id = ?", (cookie_id,)).fetchone()
+            if not row or (expected_cookie is not None and self._decrypt_secret(row[0]) != expected_cookie):
+                return False
+            cursor = self.conn.execute(
+                "UPDATE cookies SET chat_verification_required = ? WHERE id = ? AND value = ?",
+                (int(required), cookie_id, row[0]),
+            )
+            self.conn.commit()
+            return cursor.rowcount == 1
 
     def set_cookie_qr_login_grace_until(self, cookie_id: str, grace_until: int) -> bool:
         """更新账号扫码登录稳定期截止时间"""
@@ -2502,7 +2532,7 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取账号自动回复暂停时间失败: {e}")
                 return 10
 
-    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
+    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None, expected_cookie: str = None) -> bool:
         """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
         """
@@ -2511,8 +2541,13 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 
                 # 检查记录是否存在
-                self._execute_sql(cursor, "SELECT id FROM cookies WHERE id = ?", (cookie_id,))
-                exists = cursor.fetchone() is not None
+                self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE id = ?", (cookie_id,))
+                existing = cursor.fetchone()
+                exists = existing is not None
+                if expected_cookie is not None and (
+                    not existing or self._decrypt_secret(existing[1]) != expected_cookie
+                ):
+                    return False
                 
                 if not exists:
                     # 记录不存在，需要创建新记录
@@ -2580,9 +2615,14 @@ Cookie数量: {cookie_count}
                     
                     params.append(cookie_id)
                     sql = f"UPDATE cookies SET {', '.join(update_fields)} WHERE id = ?"
+                    if expected_cookie is not None:
+                        sql += " AND value = ?"
+                        params.append(existing[1])
                     
                     self._execute_sql(cursor, sql, tuple(params))
                     self.conn.commit()
+                    if cursor.rowcount != 1:
+                        return False
                     logger.info(f"更新账号 {cookie_id} 信息成功: {update_fields}")
                     return True
             except Exception as e:
