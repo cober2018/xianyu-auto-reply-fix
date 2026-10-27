@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
 from pathlib import Path
 from urllib.parse import unquote
 from urllib import request as urllib_request, error as urllib_error
+import copy
 import hashlib
 import secrets
 import time
@@ -10966,6 +10967,232 @@ async def update_item_quantity(
         raise HTTPException(status_code=500, detail=f"修改库存异常: {str(exc)}")
 
     return {"success": True, "item_id": item_id, "quantity": request.quantity if request.quantity is not None else 999}
+
+
+class ItemPriceUpdateRequest(BaseModel):
+    price: float
+    originalPrice: Optional[float] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    images: Optional[List[Any]] = None
+    categoryId: Optional[str] = None
+    catId: Optional[str] = None
+    catName: Optional[str] = None
+    channelCatId: Optional[str] = None
+    tbCatId: Optional[str] = None
+
+
+def _coerce_positive_price(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _price_edit_image_entries(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """平台图片在 imageInfos[].url。不要读 itemDO.images，那个字段不是可回写的图片列表。"""
+    infos = item.get("imageInfos") if isinstance(item, dict) else None
+    has_url = isinstance(infos, list) and any(
+        isinstance(info, dict) and str(info.get("url") or "").strip() for info in infos
+    )
+    if not has_url:
+        fallback = item.get("imageInfoDOList") if isinstance(item, dict) else None
+        infos = fallback if isinstance(fallback, list) else []
+    images = []
+    for info in infos or []:
+        if isinstance(info, str) and info.strip():
+            images.append({"url": info.strip(), "widthSize": 1000, "heightSize": 1000})
+            continue
+        if not isinstance(info, dict):
+            continue
+        url = str(info.get("url") or "").strip()
+        if not url:
+            continue
+        images.append(
+            {
+                "url": url,
+                "widthSize": info.get("widthSize") or info.get("width") or 1000,
+                "heightSize": info.get("heightSize") or info.get("height") or 1000,
+            }
+        )
+    return images
+
+
+def _item_content_snapshot(item: Dict[str, Any]) -> Dict[str, Any]:
+    item = item if isinstance(item, dict) else {}
+    text = item.get("itemTextDTO") if isinstance(item.get("itemTextDTO"), dict) else {}
+    cat = item.get("itemCatDTO") if isinstance(item.get("itemCatDTO"), dict) else {}
+    quantity = item.get("quantity")
+    if quantity is None or quantity == "":
+        quantity_text = ""
+    else:
+        try:
+            quantity_text = str(int(float(quantity)))
+        except (TypeError, ValueError):
+            quantity_text = str(quantity).strip()
+    return {
+        "title": str(text.get("title") or item.get("title") or "").strip(),
+        "description": str(text.get("desc") or item.get("desc") or item.get("description") or "").strip(),
+        "images": [image["url"] for image in _price_edit_image_entries(item)],
+        "catId": str(cat.get("catId") or "").strip(),
+        "channelCatId": str(cat.get("channelCatId") or "").strip(),
+        "quantity": quantity_text,
+    }
+
+
+def _build_price_edit_fields(item: Dict[str, Any], request: ItemPriceUpdateRequest) -> Dict[str, Any]:
+    item = item if isinstance(item, dict) else {}
+    text = item.get("itemTextDTO") if isinstance(item.get("itemTextDTO"), dict) else {}
+    cat = item.get("itemCatDTO") if isinstance(item.get("itemCatDTO"), dict) else {}
+    price_dto = item.get("itemPriceDTO") if isinstance(item.get("itemPriceDTO"), dict) else {}
+    title = str(request.title or text.get("title") or item.get("title") or "").strip()
+    if request.description is not None:
+        description = str(request.description).strip()
+    else:
+        description = str(text.get("desc") or item.get("desc") or item.get("description") or title).strip()
+    images = _price_edit_image_entries(item)
+    cat_id = str(request.catId or request.categoryId or cat.get("catId") or cat.get("channelCatId") or "").strip()
+    missing = []
+    if not title:
+        missing.append("title")
+    if not images:
+        missing.append("images")
+    if not cat_id:
+        missing.append("catId")
+    if missing:
+        raise ValueError("修改在售价格需要全量字段，缺少: " + ", ".join(missing))
+
+    channel_cat_id = str(request.channelCatId or cat.get("channelCatId") or cat_id).strip()
+    cat_name = str(request.catName or cat.get("catName") or "").strip()
+    tb_cat_id = str(request.tbCatId or cat.get("tbCatId") or "").strip()
+    old_price = None
+    if price_dto.get("priceInCent") not in (None, ""):
+        try:
+            old_price = int(round(float(price_dto.get("priceInCent")))) / 100
+        except (TypeError, ValueError):
+            old_price = None
+    if request.originalPrice is not None:
+        original_price = _coerce_positive_price(request.originalPrice)
+    else:
+        original_price = None
+        if price_dto.get("origPriceInCent") not in (None, ""):
+            try:
+                original_price = int(round(float(price_dto.get("origPriceInCent")))) / 100
+            except (TypeError, ValueError):
+                original_price = None
+        if original_price is not None and original_price <= 0:
+            original_price = None
+
+    fields = {
+        "title": title,
+        "description": description,
+        "price": old_price,
+        "originalPrice": original_price,
+        "images": images,
+        "categoryId": cat_id,
+        "catId": cat_id,
+        "catName": cat_name,
+        "channelCatId": channel_cat_id,
+        "quantity": item.get("quantity"),
+        "itemLabelExtList": item.get("itemLabelExtList") if isinstance(item.get("itemLabelExtList"), list) else [],
+        "itemAddrDTO": copy.deepcopy(item.get("itemAddrDTO")) if isinstance(item.get("itemAddrDTO"), dict) else {},
+        "itemPostFeeDTO": copy.deepcopy(item.get("itemPostFeeDTO")) if isinstance(item.get("itemPostFeeDTO"), dict) else {},
+        "itemPriceDTO": copy.deepcopy(price_dto),
+        "itemTextDTO": copy.deepcopy(text),
+    }
+    if tb_cat_id:
+        fields["tbCatId"] = tb_cat_id
+    for key in (
+        "freebies",
+        "itemTypeStr",
+        "simpleItem",
+        "userRightsProtocols",
+        "itemSkuList",
+        "itemProperties",
+        "propertyImageList",
+        "onlyTakeSelf",
+    ):
+        if key in item:
+            fields[key] = copy.deepcopy(item.get(key))
+    return fields
+
+
+def _price_in_cent_text(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return str(int(round(float(value))))
+    except (TypeError, ValueError):
+        return ""
+
+
+@app.post("/items/{cookie_id}/{item_id}/price")
+async def update_item_price(
+    cookie_id: str,
+    item_id: str,
+    request: ItemPriceUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """只改在售商品价格。商品字段以平台详情为准，不用本地 item_detail。"""
+    from utils.item_publisher import ItemPublisher
+
+    user_id = current_user["user_id"]
+    user_cookies = db_manager.get_all_cookies(user_id)
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+    cookies_str = str(user_cookies.get(cookie_id) or "").strip()
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="账号 Cookie 为空，无法修改价格")
+
+    price_value = _coerce_positive_price(request.price)
+    if price_value is None:
+        raise HTTPException(status_code=400, detail="售价必须大于 0")
+
+    proxy_config = db_manager.get_cookie_proxy_config(cookie_id)
+    try:
+        async with ItemPublisher(cookies_str, cookie_id, proxy_config=proxy_config) as publisher:
+            item = await publisher.fetch_item_detail(item_id)
+            if not item:
+                raise HTTPException(status_code=400, detail="未获取到平台商品详情，无法修改价格")
+            before = _item_content_snapshot(item)
+            fields = _build_price_edit_fields(item, request)
+            result = await publisher.edit_item_price(
+                item_id=item_id,
+                item_fields=fields,
+                new_price=price_value,
+                original_price=fields.get("originalPrice"),
+            )
+            latest_cookies_str = publisher.cookies_str
+            if not publisher.is_success_response(result):
+                raise HTTPException(status_code=400, detail=f"修改价格失败: {publisher.extract_error_message(result)}")
+            _persist_cookie_value_for_account(cookie_id, current_user, cookies_str, latest_cookies_str)
+            readback = await publisher.fetch_item_detail(item_id)
+            price_dto = readback.get("itemPriceDTO") if isinstance(readback.get("itemPriceDTO"), dict) else {}
+            expected = str(int(round(price_value * 100)))
+            if _price_in_cent_text(price_dto.get("priceInCent")) != expected:
+                raise HTTPException(status_code=500, detail="修改价格后回读校验不一致")
+            if _item_content_snapshot(readback) != before:
+                raise HTTPException(status_code=500, detail="修改价格后回读发现标题、图片、类目、描述或库存被改动")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"修改在售价格异常: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=f"修改价格异常: {str(exc)}")
+
+    return {
+        "success": True,
+        "item_id": item_id,
+        "price": price_value,
+        "priceInCent": str(int(round(price_value * 100))),
+    }
 
 
 class ItemDetailUpdate(BaseModel):

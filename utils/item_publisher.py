@@ -1,4 +1,5 @@
 import base64
+import copy
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from utils.product_sku import build_sku_payload_fields, normalize_sku_config
 
 DEFAULT_PUBLISH_QUANTITY = 999
 PUBLISH_QUANTITY_MAX = 9999
+PREFERRED_CATEGORY_IDS = ("50023914",)
 PUBLISH_SENSITIVE_REPLACEMENTS = (("直通", "系统进阶"),)
 
 
@@ -237,17 +239,153 @@ class ItemPublisher:
         }
 
     @classmethod
+    def _category_candidates_from_card_list(cls, channel_res: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """把拆在多张类目卡片里的字段按类目名拼回去。不同类目名之间不串 tbCatId。"""
+        data = channel_res.get("data") if isinstance(channel_res, dict) else None
+        cards = data.get("cardList") if isinstance(data, dict) else None
+        if not isinstance(cards, list):
+            return []
+
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            card_data = card.get("cardData") if isinstance(card.get("cardData"), dict) else card
+            property_name = str(card_data.get("propertyName") or card.get("propertyName") or "")
+            if not any(keyword in property_name for keyword in ("分类", "类目", "品类")):
+                continue
+            values = card_data.get("valuesList") or card_data.get("valueList") or []
+            if isinstance(values, dict):
+                values = [values]
+            if not isinstance(values, list) or not values:
+                if any(card_data.get(key) for key in ("catId", "catName", "channelCatId", "cat_id")):
+                    values = [card_data]
+                else:
+                    continue
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                name = str(
+                    cls._first_present_value(
+                        value, "catName", "cat_name", "channelCatName", "channel_cat_name"
+                    )
+                    or ""
+                ).strip()
+                if not name:
+                    continue
+                bucket = buckets.setdefault(
+                    name,
+                    {
+                        "catId": "",
+                        "catName": name,
+                        "channelCatId": "",
+                        "tbCatId": "",
+                        "score": 0.0,
+                        "clicked": False,
+                    },
+                )
+                cat_id = str(cls._first_present_value(value, "catId", "cat_id") or "").strip()
+                channel_cat_id = str(
+                    cls._first_present_value(value, "channelCatId", "channel_cat_id") or ""
+                ).strip()
+                transport = value.get("transportData")
+                if isinstance(transport, str):
+                    try:
+                        transport = json.loads(transport)
+                    except json.JSONDecodeError:
+                        transport = {}
+                if not isinstance(transport, dict):
+                    transport = {}
+                tb_cat_id = str(
+                    cls._first_present_value(value, "tbCatId", "tb_cat_id")
+                    or cls._first_present_value(transport, "tbCatId", "tb_cat_id")
+                    or ""
+                ).strip()
+                if cat_id and not bucket["catId"]:
+                    bucket["catId"] = cat_id
+                if channel_cat_id and not bucket["channelCatId"]:
+                    bucket["channelCatId"] = channel_cat_id
+                if tb_cat_id and not bucket["tbCatId"] and (not cat_id or not bucket["catId"] or cat_id == bucket["catId"]):
+                    bucket["tbCatId"] = tb_cat_id
+                raw_score = cls._first_present_value(value, "score", "predictScore", "confidence")
+                if raw_score in ("", None):
+                    raw_score = cls._first_present_value(card_data, "score", "predictScore")
+                try:
+                    score = float(raw_score) if raw_score not in ("", None) else 0.0
+                except (TypeError, ValueError):
+                    score = 0.0
+                if score > bucket["score"]:
+                    bucket["score"] = score
+                if value.get("isClicked") in (True, "true", "1", 1) or value.get("isUserClick") in (True, "true", "1", 1):
+                    bucket["clicked"] = True
+
+        def rank(item: Dict[str, Any]):
+            preferred = item["catId"] in PREFERRED_CATEGORY_IDS or (
+                not item["catId"] and item["channelCatId"] in PREFERRED_CATEGORY_IDS
+            )
+            completeness = sum(1 for key in ("catId", "catName", "channelCatId", "tbCatId") if item.get(key))
+            return (
+                1 if preferred else 0,
+                completeness,
+                item["score"],
+                1 if item["clicked"] else 0,
+                item["catName"],
+            )
+
+        ordered = sorted(buckets.values(), key=rank, reverse=True)
+        return [
+            {key: item[key] for key in ("catId", "catName", "channelCatId", "tbCatId")}
+            for item in ordered
+        ]
+
+    @classmethod
+    def _extract_category_from_card_list(cls, channel_res: Dict[str, Any]) -> Dict[str, str]:
+        candidates = cls._category_candidates_from_card_list(channel_res)
+        if not candidates:
+            return {}
+        best = candidates[0]
+        return {
+            "catId": str(best.get("catId") or ""),
+            "catName": str(best.get("catName") or ""),
+            "channelCatId": str(best.get("channelCatId") or ""),
+            "tbCatId": str(best.get("tbCatId") or ""),
+        }
+
+    @classmethod
     def _validate_category_recommendation(cls, channel_res: Dict[str, Any]) -> Dict[str, str]:
         data = channel_res.get("data") if isinstance(channel_res, dict) else None
         category_result = cls._normalize_category_result(
             data.get("categoryPredictResult", {}) if isinstance(data, dict) else {}
         )
-        missing_fields = [field for field, value in category_result.items() if not value]
+        required_fields = ("catId", "catName", "channelCatId")
+        if any(not category_result.get(field) for field in ("catId", "catName", "channelCatId", "tbCatId")):
+            chosen: Dict[str, Any] = {}
+            for candidate in cls._category_candidates_from_card_list(channel_res):
+                if (
+                    category_result.get("catName")
+                    and candidate.get("catName")
+                    and category_result["catName"] != candidate["catName"]
+                ):
+                    continue
+                if (
+                    category_result.get("catId")
+                    and candidate.get("catId")
+                    and category_result["catId"] != candidate["catId"]
+                ):
+                    continue
+                chosen = candidate
+                break
+            for field in ("catId", "catName", "channelCatId", "tbCatId"):
+                if not category_result.get(field) and chosen.get(field):
+                    category_result[field] = str(chosen[field])
+        missing_fields = [field for field in required_fields if not category_result.get(field)]
         if missing_fields:
             raise ValueError(
                 "自动识别类目不完整，缺少字段: "
                 f"{', '.join(missing_fields)}。请调整商品标题、首图或填写类目提示后重试。"
             )
+        if not category_result.get("tbCatId"):
+            logger.info("类目推荐未返回 tbCatId，按渠道类目继续发布")
         return category_result
 
     @classmethod
@@ -679,7 +817,11 @@ class ItemPublisher:
                 "catId": str(category_result.get("catId", "")),
                 "catName": str(category_result.get("catName", "")),
                 "channelCatId": str(category_result.get("channelCatId", "")),
-                "tbCatId": str(category_result.get("tbCatId", "")),
+                **(
+                    {"tbCatId": str(category_result.get("tbCatId")).strip()}
+                    if str(category_result.get("tbCatId") or "").strip()
+                    else {}
+                ),
             },
             "uniqueCode": self._build_unique_code(),
             "sourceId": "pcMainPublish",
@@ -703,6 +845,256 @@ class ItemPublisher:
             )
 
         return payload
+
+    @staticmethod
+    def _first_positive_price(*values: Any) -> float:
+        for value in values:
+            if isinstance(value, bool) or value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+        return 0.0
+
+    @staticmethod
+    def _stringify_existing_quantity(value: Any) -> str:
+        if isinstance(value, bool) or value is None or (isinstance(value, str) and not value.strip()):
+            return str(DEFAULT_PUBLISH_QUANTITY)
+        try:
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError
+            number = int(value) if isinstance(value, int) else int(str(value).strip())
+        except (TypeError, ValueError):
+            return str(DEFAULT_PUBLISH_QUANTITY)
+        if number < 0 or number > PUBLISH_QUANTITY_MAX:
+            return str(DEFAULT_PUBLISH_QUANTITY)
+        return str(number)
+
+    @staticmethod
+    def _build_edit_image_list(images: List[Any]) -> List[Dict[str, Any]]:
+        image_list = []
+        for image in images:
+            if isinstance(image, str):
+                url = image.strip()
+                width = 1000
+                height = 1000
+            elif isinstance(image, dict):
+                url = str(image.get("url") or image.get("image_url") or "").strip()
+                width = image.get("widthSize") or image.get("width") or 1000
+                height = image.get("heightSize") or image.get("height") or 1000
+            else:
+                continue
+            if not url:
+                continue
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                width = 1000
+            try:
+                height = int(height)
+            except (TypeError, ValueError):
+                height = 1000
+            image_list.append(
+                {
+                    "extraInfo": {"isH": "false", "isT": "false", "raw": "false"},
+                    "isQrCode": False,
+                    "url": url,
+                    "heightSize": height if height > 0 else 1000,
+                    "widthSize": width if width > 0 else 1000,
+                    "major": True,
+                    "type": 0,
+                    "status": "done",
+                }
+            )
+        return image_list
+
+    def _build_price_edit_payload(
+        self,
+        *,
+        item_id: str,
+        item_fields: Dict[str, Any],
+        new_price: Any,
+        original_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """用商品详情原字段组改价请求，只替换售价和划线价。"""
+        fields = item_fields if isinstance(item_fields, dict) else {}
+        title = str(fields.get("title") or "").strip()
+        description_value = fields.get("description")
+        description = str(title if description_value is None else description_value).strip()
+        cat_dto = fields.get("itemCatDTO") if isinstance(fields.get("itemCatDTO"), dict) else {}
+        cat_id = str(
+            fields.get("catId")
+            or fields.get("categoryId")
+            or cat_dto.get("catId")
+            or fields.get("channelCatId")
+            or cat_dto.get("channelCatId")
+            or ""
+        ).strip()
+        images = fields.get("images") or []
+        missing = []
+        if not str(item_id or "").strip():
+            missing.append("itemId")
+        if not title:
+            missing.append("title")
+        try:
+            price_value = float(new_price)
+        except (TypeError, ValueError):
+            price_value = None
+        if isinstance(new_price, bool) or price_value is None or price_value <= 0:
+            missing.append("price")
+        if not isinstance(images, list) or not images:
+            missing.append("images")
+        if not cat_id:
+            missing.append("catId")
+        if missing:
+            raise ValueError("修改在售价格需要全量字段，缺少: " + ", ".join(missing))
+
+        image_list = self._build_edit_image_list(images)
+        if not image_list:
+            raise ValueError("修改在售价格需要全量字段，缺少: images")
+
+        new_cents = int(round(price_value * 100))
+        if new_cents <= 0:
+            raise ValueError("修改在售价格需要全量字段，缺少: price")
+        original_value = self._first_positive_price(
+            original_price,
+            fields.get("originalPrice"),
+            fields.get("price"),
+            price_value,
+        )
+        original_cents = int(round(original_value * 100))
+        if original_cents < new_cents:
+            logger.info(f"【{self.cookie_id}】划线价低于售价，已抬到售价")
+            original_cents = new_cents
+
+        text_dto = fields.get("itemTextDTO") if isinstance(fields.get("itemTextDTO"), dict) else {}
+        if "titleDescSeparate" in text_dto:
+            title_desc_separate = bool(text_dto.get("titleDescSeparate"))
+        elif "titleDescSeparate" in fields:
+            title_desc_separate = bool(fields.get("titleDescSeparate"))
+        else:
+            title_desc_separate = description != title
+
+        channel_cat_id = str(fields.get("channelCatId") or cat_dto.get("channelCatId") or cat_id).strip() or cat_id
+        cat_name = str(fields.get("catName") or cat_dto.get("catName") or "").strip()
+        tb_cat_id = str(fields.get("tbCatId") or cat_dto.get("tbCatId") or "").strip()
+        item_cat = {
+            "catId": cat_id,
+            "channelCatId": channel_cat_id,
+        }
+        if cat_name:
+            item_cat["catName"] = cat_name
+        if tb_cat_id:
+            item_cat["tbCatId"] = tb_cat_id
+
+        price_src = fields.get("itemPriceDTO") if isinstance(fields.get("itemPriceDTO"), dict) else {}
+        price_dto = copy.deepcopy(price_src)
+        price_dto["priceInCent"] = str(new_cents)
+        price_dto["origPriceInCent"] = str(original_cents)
+        if price_dto.get("noBargain") in (None, ""):
+            price_dto["noBargain"] = "false"
+
+        labels = fields.get("itemLabelExtList")
+        if not isinstance(labels, list):
+            labels = []
+        address = fields.get("itemAddrDTO")
+        if not isinstance(address, dict):
+            address = {}
+        protocols = fields.get("userRightsProtocols")
+        if not isinstance(protocols, list):
+            protocols = [{"enable": False, "serviceCode": "SKILL_PLAY_NO_MIND"}]
+
+        payload = {
+            "itemId": str(item_id).strip(),
+            "freebies": fields["freebies"] if "freebies" in fields and fields.get("freebies") is not None else False,
+            "itemTypeStr": str(fields.get("itemTypeStr") or "b"),
+            "quantity": self._stringify_existing_quantity(fields.get("quantity")),
+            "simpleItem": fields["simpleItem"] if "simpleItem" in fields and fields.get("simpleItem") not in (None, "") else "true",
+            "imageInfoDOList": image_list,
+            "itemTextDTO": {
+                "desc": description,
+                "title": title,
+                "titleDescSeparate": title_desc_separate,
+            },
+            "itemLabelExtList": copy.deepcopy(labels),
+            "itemPriceDTO": price_dto,
+            "userRightsProtocols": copy.deepcopy(protocols),
+            "itemAddrDTO": copy.deepcopy(address),
+            "defaultPrice": False,
+            "itemCatDTO": item_cat,
+            "uniqueCode": self._build_unique_code(),
+            "sourceId": "pcItemEdit",
+            "bizcode": "pcItemEdit",
+            "publishScene": "pcItemEdit",
+        }
+        for key in ("itemSkuList", "itemProperties", "propertyImageList"):
+            if isinstance(fields.get(key), list):
+                payload[key] = copy.deepcopy(fields[key])
+
+        post_fee = fields.get("itemPostFeeDTO")
+        if isinstance(post_fee, dict) and post_fee:
+            payload["itemPostFeeDTO"] = copy.deepcopy(post_fee)
+            if post_fee.get("onlyTakeSelf") or fields.get("onlyTakeSelf"):
+                payload["onlyTakeSelf"] = True
+        else:
+            payload["itemPostFeeDTO"] = {
+                "canFreeShipping": False,
+                "supportFreight": False,
+                "onlyTakeSelf": False,
+            }
+            delivery_choice = str(fields.get("deliveryChoice") or "").strip()
+            if delivery_choice in self.ALLOWED_DELIVERY_CHOICES:
+                self._apply_delivery_settings(
+                    payload=payload,
+                    delivery_choice=delivery_choice,
+                    post_price=fields.get("postPrice"),
+                    can_self_pickup=bool(fields.get("canSelfPickup") or fields.get("onlyTakeSelf")),
+                )
+        return payload
+
+    async def fetch_item_detail(self, item_id: str) -> Dict[str, Any]:
+        """拉平台商品详情。本地 item_detail 不是这份结构，改价不能用它。"""
+        cleaned_item_id = str(item_id or "").strip()
+        if not cleaned_item_id:
+            raise ValueError("获取商品详情缺少商品 ID")
+        response = await self._post_mtop(
+            api_name="mtop.taobao.idle.pc.detail",
+            version="1.0",
+            payload={"itemId": cleaned_item_id},
+            spm_cnt="a21ybx.im.0.0",
+            spm_pre="a21ybx.home.sidebar.1.46413da6EPl7v5",
+        )
+        if not self.is_success_response(response):
+            raise RuntimeError(f"获取商品详情失败: {self.extract_error_message(response)}")
+        data = response.get("data") if isinstance(response.get("data"), dict) else {}
+        item = data.get("itemDO")
+        return item if isinstance(item, dict) else {}
+
+    async def edit_item_price(
+        self,
+        *,
+        item_id: str,
+        item_fields: Dict[str, Any],
+        new_price: Any,
+        original_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """改在售价格。缺标题、图片或类目时直接拒绝，不请求平台。"""
+        payload = self._build_price_edit_payload(
+            item_id=item_id,
+            item_fields=item_fields,
+            new_price=new_price,
+            original_price=original_price,
+        )
+        return await self._post_mtop(
+            api_name="mtop.idle.pc.idleitem.edit",
+            version="1.0",
+            payload=payload,
+            spm_cnt="a21ybx.publish.0.0",
+            spm_pre="a21ybx.home.sidebar.1.46413da6EPl7v5",
+        )
 
     async def edit_item_quantity(
         self,
@@ -792,6 +1184,9 @@ class ItemPublisher:
             "itemPriceDTO": {
                 "priceInCent": str(int(round(float(price_value) * 100))),
             },
+            "sourceId": "pcItemEdit",
+            "bizcode": "pcItemEdit",
+            "publishScene": "pcItemEdit",
         }
         return await self._post_mtop(
             api_name="mtop.idle.pc.idleitem.edit",
