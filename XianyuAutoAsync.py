@@ -32,6 +32,13 @@ import aiohttp
 from collections import defaultdict, deque
 from typing import Any, Dict, Optional, Tuple
 from db_manager import db_manager
+from utils.cookie_identity import (
+    IDENTITY_FIELDS,
+    cookie_full_fingerprint,
+    cookie_identity_fingerprint,
+    cookie_identity_map,
+    cookies_equivalent,
+)
 from utils.notification_dispatcher import (
     build_face_verify_notification,
     dispatch_account_notifications,
@@ -346,13 +353,23 @@ class XianyuLive:
     @classmethod
     def authorize_chat_handoff(cls, cookie_id: str, cookies_str: str):
         # 完整性与归属由凭证入口在保存前校验；此处只给已验证的快照授权。
+        # 比对 unb + cookie2 + _m_h5_tk，避免序列化顺序不同导致交接永远对不上。
         with cls._auth_recovery_lock:
             persisted_cookie = db_manager.get_cookie(cookie_id)
-            if persisted_cookie is not None and persisted_cookie != cookies_str:
-                return False
+            canonical = cookies_str
+            if persisted_cookie is not None:
+                if not cookies_equivalent(persisted_cookie, cookies_str):
+                    return False
+                canonical = persisted_cookie
+            identity = cookie_identity_map(canonical)
+            if all(identity[key] for key in IDENTITY_FIELDS):
+                fingerprint = cookie_identity_fingerprint(canonical)
+            else:
+                fingerprint = cookie_full_fingerprint(cookies_str)
             cls._chat_auth_generations[cookie_id] = cls._chat_auth_generations.get(cookie_id, 0) + 1
             cls._verified_chat_handoffs[cookie_id] = {
-                'fingerprint': hashlib.sha256(cookies_str.encode()).hexdigest(),
+                'fingerprint': fingerprint,
+                'legacy_fingerprint': cookie_full_fingerprint(cookies_str),
                 'deadline': time.time() + 30,
             }
             active = cls.get_instance(cookie_id)
@@ -361,11 +378,27 @@ class XianyuLive:
                 active.chat_ready = False
         return True
 
+    @staticmethod
+    def _cookie_fingerprints_match(stored_fingerprint, legacy_fingerprint, cookies_str: str) -> bool:
+        if not cookies_str or not stored_fingerprint:
+            return False
+        full_fp = cookie_full_fingerprint(cookies_str)
+        if stored_fingerprint == full_fp or (legacy_fingerprint and legacy_fingerprint == full_fp):
+            return True
+        identity = cookie_identity_map(cookies_str)
+        if all(identity.get(key) for key in IDENTITY_FIELDS):
+            return stored_fingerprint == cookie_identity_fingerprint(cookies_str)
+        return False
+
     @classmethod
     def consume_chat_handoff(cls, cookie_id: str, cookies_str: str):
         with cls._auth_recovery_lock:
             handoff = cls._verified_chat_handoffs.get(cookie_id)
-            if handoff and handoff['fingerprint'] == hashlib.sha256(cookies_str.encode()).hexdigest():
+            if handoff and cls._cookie_fingerprints_match(
+                handoff.get('fingerprint'),
+                handoff.get('legacy_fingerprint'),
+                cookies_str,
+            ):
                 return cls._verified_chat_handoffs.pop(cookie_id)
         return None
 
@@ -378,7 +411,7 @@ class XianyuLive:
         expected_cookie = getattr(self, '_persisted_cookie_value', None)
         if check_cookie and expected_cookie is not None:
             current_cookie = db_manager.get_cookie(self.cookie_id)
-            if current_cookie is not None and current_cookie != expected_cookie:
+            if current_cookie is not None and not cookies_equivalent(current_cookie, expected_cookie):
                 return False
         if getattr(self, 'register_instance', False):
             return self._instances.get(self.cookie_id, self) is self
@@ -411,7 +444,7 @@ class XianyuLive:
             if acquired:
                 self.release_auth_recovery_lock(self.cookie_id, owner)
 
-    async def _pause_chat_for_verification(self, reason: str):
+    async def _pause_chat_for_verification(self, reason: str, *, notify: bool = True):
         persisted = False
         with self._auth_recovery_lock:
             if not self._chat_auth_is_current():
@@ -449,7 +482,8 @@ class XianyuLive:
                 await asyncio.wait_for(ws.close(), timeout=5)
             except Exception as error:
                 logger.warning(f"【{self.cookie_id}】关闭受限聊天连接失败: {self._safe_str(error)}")
-        await self.send_token_refresh_notification(self.last_token_refresh_error_message, 'chat_verification_required')
+        if notify:
+            await self.send_token_refresh_notification(self.last_token_refresh_error_message, 'chat_verification_required')
 
     def _require_chat_ready(self, ws):
         if (self._chat_auth_blocked() or ws not in getattr(self, '_ready_websockets', set())
@@ -459,6 +493,9 @@ class XianyuLive:
     # 通用预热 token：用于手动刷新/恢复预检成功后的新实例首轮复用
     _auth_prewarmed_tokens = {}  # {cookie_id: {'token': str, 'timestamp': float, 'source': str}}
     _auth_prewarmed_token_ttl = 180
+    _initial_token_settle_deadlines = {}
+    PLATFORM_PUNISH_MESSAGE = "账号被平台风控，自动恢复已停止。重复扫码无效，请等待平台冷却后再处理"
+    TOKEN_RECOVERY_EXHAUSTED_MESSAGE = "Token自动恢复连续失败已达上限，已停止请求平台接口，需人工处理"
 
     # 初始化鉴权失败熔断：区分于 WebSocket 建链失败，避免重连风暴
     _init_auth_failure_state = {}  # {cookie_id: {'count': int, 'window_started_at': float, 'last_failure_at': float, 'last_reason': str, 'circuit_until': float}}
@@ -489,11 +526,21 @@ class XianyuLive:
         if not cookie_id or not token:
             return
         cls._cleanup_auth_prewarmed_tokens()
+        fingerprint = None
+        legacy_fingerprint = None
+        if cookies_str:
+            legacy_fingerprint = cookie_full_fingerprint(cookies_str)
+            identity = cookie_identity_map(cookies_str)
+            if all(identity[key] for key in IDENTITY_FIELDS):
+                fingerprint = cookie_identity_fingerprint(cookies_str)
+            else:
+                fingerprint = legacy_fingerprint
         cls._auth_prewarmed_tokens[cookie_id] = {
             'token': token,
             'timestamp': time.time(),
             'source': source,
-            'fingerprint': hashlib.sha256(cookies_str.encode()).hexdigest() if cookies_str else None,
+            'fingerprint': fingerprint,
+            'legacy_fingerprint': legacy_fingerprint,
         }
 
     @classmethod
@@ -514,6 +561,251 @@ class XianyuLive:
         if not cookie_id:
             return
         cls._auth_prewarmed_tokens.pop(cookie_id, None)
+
+    @staticmethod
+    def response_is_platform_punish(payload) -> bool:
+        if payload is None:
+            return False
+        if isinstance(payload, str):
+            text = payload
+        else:
+            try:
+                text = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                text = str(payload)
+        markers = ("RGV587_ERROR", "FAIL_SYS_USER_VALIDATE", "_____tmd_____/punish", "punish?x5secdata")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def plan_token_recovery_failure(attempt, *, terminal=False, now=None, schedule=None, max_attempts=None, hold_seconds=None) -> dict:
+        """连续失败的等待计划。第 1/2/3 次分别等 10 分钟、30 分钟、2 小时，第 5 次或风控立即停止。"""
+        now = time.time() if now is None else float(now)
+        if schedule is None:
+            raw = RISK_CONTROL.get("token_recovery_backoff_schedule_seconds", [600, 1800, 7200])
+            schedule = [int(item) for item in (raw or [600, 1800, 7200])]
+        if not schedule:
+            schedule = [600, 1800, 7200]
+        if max_attempts is None:
+            max_attempts = int(RISK_CONTROL.get("token_recovery_max_attempts", 5) or 5)
+        if hold_seconds is None:
+            hold_seconds = int(RISK_CONTROL.get("token_recovery_hold_seconds", 21600) or 21600)
+        attempt = max(1, int(attempt or 1))
+        max_attempts = max(1, int(max_attempts))
+        stop = bool(terminal) or attempt >= max_attempts
+        if stop:
+            return {
+                "attempt": attempt,
+                "wait_seconds": 0,
+                "stop": True,
+                "terminal": bool(terminal),
+                "hold_until": int(now + int(hold_seconds)),
+            }
+        index = min(attempt - 1, len(schedule) - 1)
+        return {
+            "attempt": attempt,
+            "wait_seconds": int(schedule[index]),
+            "stop": False,
+            "terminal": False,
+            "hold_until": 0,
+        }
+
+    def _token_recovery_hold_active(self, now=None) -> bool:
+        now = time.time() if now is None else float(now)
+        try:
+            budget = db_manager.get_token_recovery_budget(self.cookie_id) or {}
+        except Exception:
+            return False
+        hold_until = int(budget.get("hold_until") or 0)
+        attempts = int(budget.get("attempts") or 0)
+        if hold_until > now:
+            return True
+        if hold_until > 0 and now >= hold_until and attempts > 0:
+            try:
+                db_manager.clear_token_recovery_budget(self.cookie_id)
+            except Exception:
+                pass
+            self._last_token_recovery_plan = None
+            return False
+        return False
+
+    def _token_recovery_hold_wait(self, now=None) -> int:
+        now = time.time() if now is None else float(now)
+        try:
+            budget = db_manager.get_token_recovery_budget(self.cookie_id) or {}
+            remaining = int(budget.get("hold_until") or 0) - now
+        except Exception:
+            remaining = 600
+        if remaining <= 0:
+            return 600
+        return max(1, min(600, int(remaining)))
+
+    async def _record_token_probe_failure(self, reason, *, terminal=False):
+        """记一次真实打到平台的 Token 失败。递归重试的外层不要调用。"""
+        try:
+            budget = db_manager.get_token_recovery_budget(self.cookie_id) or {}
+        except Exception:
+            budget = {}
+        attempt = int(budget.get("attempts") or 0) + 1
+        punish = bool(terminal) or reason == "platform_punish" or self.response_is_platform_punish(reason)
+        plan = self.plan_token_recovery_failure(attempt, terminal=punish)
+        self._last_token_recovery_plan = plan
+        hold_reason = "platform_punish" if punish else (reason or "token_probe_failed")
+        try:
+            db_manager.set_token_recovery_budget(
+                self.cookie_id,
+                attempts=plan["attempt"],
+                hold_until=plan["hold_until"],
+                hold_reason=hold_reason,
+            )
+        except Exception as error:
+            detail = self._safe_str(error) if hasattr(self, "_safe_str") else type(error).__name__
+            logger.error(f"【{self.cookie_id}】写入Token恢复预算失败: {detail}")
+        if plan["stop"]:
+            if punish:
+                self.last_token_refresh_status = "platform_risk_hold"
+                self.last_token_refresh_error_message = self.PLATFORM_PUNISH_MESSAGE
+                notification_type = "platform_risk_hold"
+            else:
+                self.last_token_refresh_status = "token_recovery_manual_hold"
+                self.last_token_refresh_error_message = self.TOKEN_RECOVERY_EXHAUSTED_MESSAGE
+                notification_type = "token_recovery_manual_hold"
+            logger.warning(f"【{self.cookie_id}】{self.last_token_refresh_error_message}")
+            try:
+                await self.send_token_refresh_notification(self.last_token_refresh_error_message, notification_type)
+            except Exception as error:
+                detail = self._safe_str(error) if hasattr(self, "_safe_str") else type(error).__name__
+                logger.warning(f"【{self.cookie_id}】恢复停机通知发送失败: {detail}")
+        else:
+            logger.warning(
+                f"【{self.cookie_id}】Token预检第{plan['attempt']}次失败，{plan['wait_seconds']}秒后再试"
+            )
+        return plan
+
+    @classmethod
+    def persist_token_recovery_hold(cls, cookie_id: str, reason: str = "platform_punish", now=None):
+        now = time.time() if now is None else float(now)
+        try:
+            current = db_manager.get_token_recovery_budget(cookie_id) or {}
+        except Exception:
+            current = {}
+        max_attempts = int(RISK_CONTROL.get("token_recovery_max_attempts", 5) or 5)
+        attempt = max(int(current.get("attempts") or 0), max_attempts)
+        plan = cls.plan_token_recovery_failure(attempt, terminal=True, now=now)
+        db_manager.set_token_recovery_budget(
+            cookie_id,
+            attempts=plan["attempt"],
+            hold_until=plan["hold_until"],
+            hold_reason=reason or "platform_punish",
+        )
+        return plan
+
+    @classmethod
+    def defer_initial_token_preflight(cls, cookie_id: str, seconds: float):
+        if not cookie_id or not seconds or float(seconds) <= 0:
+            return
+        cls._initial_token_settle_deadlines[str(cookie_id)] = time.time() + float(seconds)
+
+    @classmethod
+    async def prewarm_token_from_cookie(cls, cookie_id, cookies_str, proxy=None, source="qr_login"):
+        """扫码成功后打一次 Token 预检。命中风控不缓存，成功才交给新实例复用。"""
+        from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
+
+        result = {
+            "cached": False,
+            "status": "inconclusive",
+            "platform_punish": False,
+            "token": None,
+            "verification_url": None,
+        }
+        try:
+            probe = await asyncio.to_thread(
+                probe_cookie_verification_from_cookie,
+                cookies_str,
+                proxy,
+                8.0,
+            )
+        except Exception as error:
+            logger.warning(f"【{cookie_id}】扫码Token预热未完成: {type(error).__name__}")
+            return result
+        payload = probe.get("payload") if isinstance(probe, dict) else None
+        status = (probe or {}).get("status") or "unknown"
+        verification_url = (probe or {}).get("verification_url")
+        result["status"] = status
+        result["verification_url"] = verification_url
+        if cls.response_is_platform_punish(payload) or cls.response_is_platform_punish(verification_url):
+            result["platform_punish"] = True
+            result["status"] = "platform_punish"
+            return result
+        data = payload.get("data") if isinstance(payload, dict) else None
+        token = str((data or {}).get("accessToken") or "").strip() if isinstance(data, dict) else ""
+        if status == "cookie_valid" and token:
+            cls.cache_auth_prewarmed_token(cookie_id, token, source=source, cookies_str=cookies_str)
+            result["cached"] = True
+            result["token"] = token
+        return result
+
+    async def _maybe_recheck_token_after_qr_grace(self):
+        """稳定期结束后，验证标记仍在且 Cookie 未再变时，只做一次预检。"""
+        if self._get_qr_login_grace_remaining_seconds() > 0:
+            return
+        try:
+            if not db_manager.get_chat_verification_required(self.cookie_id):
+                return
+            budget = db_manager.get_token_recovery_budget(self.cookie_id) or {}
+        except Exception:
+            return
+        if int(budget.get("grace_rechecked") or 0):
+            return
+        if self._token_recovery_hold_active():
+            try:
+                db_manager.mark_token_recovery_grace_rechecked(self.cookie_id)
+            except Exception:
+                pass
+            return
+        try:
+            db_manager.mark_token_recovery_grace_rechecked(self.cookie_id)
+        except Exception:
+            return
+        probe = await self.prewarm_token_from_cookie(
+            self.cookie_id,
+            self.cookies_str,
+            proxy=getattr(self, "proxy_config", None),
+            source="qr_grace_recheck",
+        )
+        if probe.get("platform_punish"):
+            try:
+                self.persist_token_recovery_hold(self.cookie_id, reason="platform_punish")
+            except Exception as error:
+                detail = self._safe_str(error) if hasattr(self, "_safe_str") else type(error).__name__
+                logger.warning(f"【{self.cookie_id}】写入平台风控停机失败: {detail}")
+            self.last_token_refresh_status = "platform_risk_hold"
+            self.last_token_refresh_error_message = self.PLATFORM_PUNISH_MESSAGE
+            try:
+                await self.send_token_refresh_notification(self.PLATFORM_PUNISH_MESSAGE, "platform_risk_hold")
+            except Exception:
+                pass
+            return
+        if not (probe.get("cached") and probe.get("token")):
+            return
+        try:
+            cleared = db_manager.set_chat_verification_required(
+                self.cookie_id, False, expected_cookie=self.cookies_str
+            )
+        except Exception:
+            cleared = False
+        if not cleared:
+            return
+        self.chat_verification_required = False
+        self.current_token = probe["token"]
+        self.last_token_refresh_time = time.time()
+        self.last_token_refresh_status = "success"
+        self.last_token_refresh_error_message = None
+        self.pop_auth_prewarmed_token(self.cookie_id)
+        try:
+            db_manager.clear_token_recovery_budget(self.cookie_id)
+        except Exception:
+            pass
+        logger.info(f"【{self.cookie_id}】扫码稳定期结束预检通过，已清除聊天验证标记")
 
     @classmethod
     def _cleanup_manual_refresh_state(cls):
@@ -2330,12 +2622,19 @@ class XianyuLive:
 
         prewarmed_token_info = self.pop_auth_prewarmed_token(self.cookie_id)
         if (prewarmed_token_info and not self.chat_verification_required
-                and prewarmed_token_info.get('fingerprint') == hashlib.sha256(self.cookies_str.encode()).hexdigest()):
+                and self._cookie_fingerprints_match(
+                    prewarmed_token_info.get('fingerprint'),
+                    prewarmed_token_info.get('legacy_fingerprint'),
+                    self.cookies_str,
+                )):
             self.current_token = prewarmed_token_info.get('token')
             self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
             logger.info(
                 f"【{cookie_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
             )
+        self._last_token_recovery_plan = None
+        settle_deadline = self._initial_token_settle_deadlines.pop(self.cookie_id, 0)
+        self._initial_token_settle_until = float(settle_deadline or 0) if not self.current_token else 0
 
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
@@ -9369,13 +9668,16 @@ class XianyuLive:
         raise InitAuthError(f"手动刷新后的Token预检失败，状态: {self.last_token_refresh_status or 'unknown'}")
 
     async def refresh_token(self, captcha_retry_count: int = 0, allow_password_login_recovery: bool = True):
+        if self._token_recovery_hold_active():
+            logger.warning(f"【{self.cookie_id}】Token自动恢复已停止，本次不请求Token接口")
+            return None
         if self._chat_auth_blocked():
             return None
         if self.token_refresh_lock.locked():
             logger.info(f"【{self.cookie_id}】Token刷新已有执行中任务，等待当前流程完成后复用结果")
 
         async with self.token_refresh_lock:
-            if self._chat_auth_blocked():
+            if self._token_recovery_hold_active() or self._chat_auth_blocked():
                 return None
             dedup_window = max(5, int(RISK_CONTROL.get('token_refresh_dedup_window_seconds', 60) or 60))
             if (
@@ -9535,6 +9837,7 @@ class XianyuLive:
             return None
         # 初始化通知发送标志，避免重复发送通知
         notification_sent = False
+        token_request_sent = False
         
         try:
             logger.info(f"【{self.cookie_id}】开始刷新token... (滑块验证重试次数: {captcha_retry_count})")
@@ -9643,6 +9946,7 @@ class XianyuLive:
             request_kwargs = {}
             if getattr(self, '_http_proxy_url', None):
                 request_kwargs['proxy'] = self._http_proxy_url
+            token_request_sent = True
             async with self.session.post(
                     api_url,
                     params=params,
@@ -9690,6 +9994,11 @@ class XianyuLive:
                                 if not getattr(self, "_chat_recovery_in_progress", False):
                                     self._clear_qr_login_grace_period()
                                 self.clear_init_auth_failure_state(self.cookie_id)
+                                try:
+                                    db_manager.clear_token_recovery_budget(self.cookie_id)
+                                except Exception:
+                                    pass
+                                self._last_token_recovery_plan = None
                                 self.last_init_failure_reason = None
                                 self.last_init_failure_type = None
                                 self.init_auth_failures = 0
@@ -9708,7 +10017,12 @@ class XianyuLive:
 
                     # 检查是否需要滑块验证
                     if self._need_captcha_verification(res_json):
-                        await self._pause_chat_for_verification("token_refresh")
+                        terminal = self.response_is_platform_punish(res_json)
+                        await self._pause_chat_for_verification("token_refresh", notify=not terminal)
+                        await self._record_token_probe_failure(
+                            "platform_punish" if terminal else "captcha_verification",
+                            terminal=terminal,
+                        )
                         notification_sent = True
                         return None
 
@@ -9853,6 +10167,11 @@ class XianyuLive:
                                 self._clear_pending_slider_success_notice("恢复流程失败")
                                 # 标记已发送通知，避免重复通知
                                 notification_sent = True
+                                terminal = self.response_is_platform_punish(res_json)
+                                await self._record_token_probe_failure(
+                                    "platform_punish" if terminal else "session_expired_recovery_failed",
+                                    terminal=terminal,
+                                )
                                 # 返回None，让调用者知道刷新失败
                                 return None
                             else:
@@ -9893,6 +10212,11 @@ class XianyuLive:
                             await self.send_token_refresh_notification(f"Token刷新失败: {res_json}", "token_refresh_failed")
                     else:
                         logger.info(f"【{self.cookie_id}】已发送滑块验证相关通知，跳过Token刷新失败通知")
+                    terminal = self.response_is_platform_punish(res_json)
+                    await self._record_token_probe_failure(
+                        "platform_punish" if terminal else "token_refresh_failed",
+                        terminal=terminal,
+                    )
                     return None
 
         except Exception as e:
@@ -9921,6 +10245,8 @@ class XianyuLive:
                     await self.send_token_refresh_notification(f"Token刷新异常: {str(e)}", "token_refresh_exception")
             else:
                 logger.info(f"【{self.cookie_id}】已发送滑块验证相关通知，跳过Token刷新异常通知")
+            if token_request_sent:
+                await self._record_token_probe_failure("token_refresh_exception", terminal=False)
             return None
 
     def _need_captcha_verification(self, res_json: dict) -> bool:
@@ -14606,6 +14932,12 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止Token刷新循环")
                         break
 
+                    if self._token_recovery_hold_active():
+                        hold_wait = self._token_recovery_hold_wait()
+                        logger.warning(f"【{self.cookie_id}】Token自动恢复已停止，{hold_wait}秒内不请求Token接口")
+                        await self._interruptible_sleep(hold_wait)
+                        continue
+
                     current_time = time.time()
                     if self._chat_auth_blocked() or self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
                         logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，暂停会话保活循环")
@@ -14642,11 +14974,23 @@ class XianyuLive:
                                     scheduled_error_message,
                                     "token_scheduled_refresh_failed"
                                 )
+                            plan = getattr(self, "_last_token_recovery_plan", None) or {}
+                            if self._token_recovery_hold_active() or plan.get("stop"):
+                                hold_wait = self._token_recovery_hold_wait()
+                                logger.warning(f"【{self.cookie_id}】自动恢复已停止，不再请求Token接口")
+                                self._last_token_recovery_plan = None
+                                await self._interruptible_sleep(hold_wait)
+                                continue
+                            wait_seconds = int(plan.get("wait_seconds") or 0)
+                            if wait_seconds <= 0:
+                                wait_seconds = self._compute_token_retry_wait_seconds(current_time)
+                            else:
+                                self._last_token_recovery_plan = None
                             logger.warning(
                                 f"【{self.cookie_id}】重型Token恢复失败(status={last_refresh_status})，"
-                                f"{self._compute_token_retry_wait_seconds(current_time)} 秒后重试"
+                                f"{wait_seconds} 秒后重试"
                             )
-                            await self._interruptible_sleep(self._compute_token_retry_wait_seconds(current_time))
+                            await self._interruptible_sleep(wait_seconds)
                         else:
                             logger.warning(
                                 f"【{self.cookie_id}】轻量保活失败(status={keepalive_status})，"
@@ -14834,6 +15178,13 @@ class XianyuLive:
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
             if self._should_defer_auth_recovery_for_qr_grace():
                 raise InitAuthError(self.last_token_refresh_error_message or "扫码登录稳定期中，暂缓初始化Token预检")
+
+            settle_until = float(getattr(self, "_initial_token_settle_until", 0) or 0)
+            if not self.current_token and settle_until > time.time():
+                delay = settle_until - time.time()
+                logger.info(f"【{self.cookie_id}】Cookie刚更新，延迟 {delay:.1f} 秒后再做首次Token预检")
+                await self._interruptible_sleep(delay)
+            self._initial_token_settle_until = 0
 
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
@@ -19189,6 +19540,16 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止主循环")
                         break
 
+                    await self._maybe_recheck_token_after_qr_grace()
+                    if self._token_recovery_hold_active():
+                        hold_wait = self._token_recovery_hold_wait()
+                        self._set_connection_state(ConnectionState.RECONNECTING, "Token自动恢复已停止，等待平台冷却")
+                        logger.warning(
+                            f"【{self.cookie_id}】Token自动恢复已停止，{hold_wait}秒内不发起连接、不请求Token接口"
+                        )
+                        await self._interruptible_sleep(hold_wait)
+                        continue
+
                     init_auth_state = self.get_init_auth_failure_state(self.cookie_id) or {}
                     circuit_until = init_auth_state.get('circuit_until', 0)
                     if circuit_until and time.time() < circuit_until:
@@ -19390,7 +19751,18 @@ class XianyuLive:
                     logger.error(f"【{self.cookie_id}】初始化鉴权失败 ({self.init_auth_failures}/{self._init_auth_failure_threshold})")
                     logger.error(f"【{self.cookie_id}】初始化失败原因: {error_msg}")
 
-                    retry_delay = self._calculate_retry_delay(error_msg)
+                    plan = getattr(self, "_last_token_recovery_plan", None) or {}
+                    if self._token_recovery_hold_active() or plan.get("stop"):
+                        hold_wait = self._token_recovery_hold_wait()
+                        logger.warning(f"【{self.cookie_id}】自动恢复已停止，不再请求Token接口")
+                        self._last_token_recovery_plan = None
+                        self._reset_background_tasks()
+                        await self._interruptible_sleep(hold_wait)
+                        continue
+
+                    planned_wait = int(plan.get("wait_seconds") or 0)
+                    retry_delay = planned_wait or self._calculate_retry_delay(error_msg)
+                    self._last_token_recovery_plan = None
                     circuit_until = init_auth_state.get('circuit_until', 0)
                     if circuit_until and time.time() < circuit_until:
                         circuit_wait = max(1, int(circuit_until - time.time()))
@@ -19398,6 +19770,8 @@ class XianyuLive:
                         logger.warning(
                             f"【{self.cookie_id}】初始化鉴权失败已达到阈值，进入冷静期 {circuit_wait} 秒后再重试"
                         )
+                    elif planned_wait:
+                        logger.warning(f"【{self.cookie_id}】Token预检失败，{retry_delay} 秒后再试")
                     else:
                         logger.warning(f"【{self.cookie_id}】将在 {retry_delay} 秒后重试初始化鉴权...")
 

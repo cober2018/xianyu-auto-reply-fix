@@ -136,6 +136,12 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'post_slider_retry_delay_max': 10.0,
     'token_refresh_dedup_window_seconds': 60,
     'token_retry_min_wait_seconds': 180,
+    # Token 预检连续失败：10分钟 → 30分钟 → 2小时，第5次或账号级风控后停止打接口
+    'token_recovery_backoff_schedule_seconds': [600, 1800, 7200],
+    'token_recovery_max_attempts': 5,
+    'token_recovery_hold_seconds': 21600,
+    # 扫码后没有预热到 Token 时，首轮预检前的落库稳定等待
+    'token_preflight_settle_seconds': 5,
     'max_post_slider_session_retries': 1,
     'soft_auth_token_preflight_enabled': True,
     'soft_auth_token_preflight_timeout_seconds': 5.0,

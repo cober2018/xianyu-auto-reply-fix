@@ -330,6 +330,10 @@ class DBManager:
                 status_note TEXT DEFAULT '',
                 qr_login_grace_until INTEGER DEFAULT 0,
                 chat_verification_required INTEGER NOT NULL DEFAULT 0,
+                token_recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                token_recovery_hold_until INTEGER NOT NULL DEFAULT 0,
+                token_recovery_hold_reason TEXT DEFAULT '',
+                token_recovery_grace_rechecked INTEGER NOT NULL DEFAULT 0,
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -1086,6 +1090,15 @@ Cookie数量: {cookie_count}
 
             if 'chat_verification_required' not in cookie_columns:
                 cursor.execute("ALTER TABLE cookies ADD COLUMN chat_verification_required INTEGER NOT NULL DEFAULT 0")
+
+            if 'token_recovery_attempts' not in cookie_columns:
+                cursor.execute("ALTER TABLE cookies ADD COLUMN token_recovery_attempts INTEGER NOT NULL DEFAULT 0")
+            if 'token_recovery_hold_until' not in cookie_columns:
+                cursor.execute("ALTER TABLE cookies ADD COLUMN token_recovery_hold_until INTEGER NOT NULL DEFAULT 0")
+            if 'token_recovery_hold_reason' not in cookie_columns:
+                cursor.execute("ALTER TABLE cookies ADD COLUMN token_recovery_hold_reason TEXT DEFAULT ''")
+            if 'token_recovery_grace_rechecked' not in cookie_columns:
+                cursor.execute("ALTER TABLE cookies ADD COLUMN token_recovery_grace_rechecked INTEGER NOT NULL DEFAULT 0")
 
             # 检查cookies表是否存在pause_duration列
             if 'pause_duration' not in cookie_columns:
@@ -2475,8 +2488,12 @@ Cookie数量: {cookie_count}
                                        expected_cookie: str = None) -> bool:
         with self.lock:
             row = self.conn.execute("SELECT value FROM cookies WHERE id = ?", (cookie_id,)).fetchone()
-            if not row or (expected_cookie is not None and self._decrypt_secret(row[0]) != expected_cookie):
+            if not row:
                 return False
+            if expected_cookie is not None:
+                from utils.cookie_identity import cookies_equivalent
+                if not cookies_equivalent(self._decrypt_secret(row[0]), expected_cookie):
+                    return False
             cursor = self.conn.execute(
                 "UPDATE cookies SET chat_verification_required = ? WHERE id = ? AND value = ?",
                 (int(required), cookie_id, row[0]),
@@ -2489,12 +2506,90 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "UPDATE cookies SET qr_login_grace_until = ? WHERE id = ?", (int(grace_until or 0), cookie_id))
+                grace_value = int(grace_until or 0)
+                if grace_value > 0:
+                    self._execute_sql(
+                        cursor,
+                        "UPDATE cookies SET qr_login_grace_until = ?, token_recovery_grace_rechecked = 0 WHERE id = ?",
+                        (grace_value, cookie_id),
+                    )
+                else:
+                    self._execute_sql(cursor, "UPDATE cookies SET qr_login_grace_until = ? WHERE id = ?", (grace_value, cookie_id))
                 self.conn.commit()
                 logger.info(f"更新账号 {cookie_id} 扫码稳定期截止时间: {int(grace_until or 0)}")
                 return True
             except Exception as e:
                 logger.error(f"更新账号扫码稳定期失败: {e}")
+                return False
+
+    def get_token_recovery_budget(self, cookie_id: str) -> dict:
+        """读取 Token 自动恢复预算。列缺失或账号不存在时返回空预算。"""
+        empty = {"attempts": 0, "hold_until": 0, "hold_reason": "", "grace_rechecked": 0}
+        with self.lock:
+            try:
+                row = self.conn.execute(
+                    """SELECT token_recovery_attempts, token_recovery_hold_until,
+                              token_recovery_hold_reason, token_recovery_grace_rechecked
+                       FROM cookies WHERE id = ?""",
+                    (cookie_id,),
+                ).fetchone()
+            except Exception as e:
+                logger.error(f"读取Token恢复预算失败: {e}")
+                return dict(empty)
+            if not row:
+                return dict(empty)
+            return {
+                "attempts": int(row[0] or 0),
+                "hold_until": int(row[1] or 0),
+                "hold_reason": row[2] or "",
+                "grace_rechecked": int(row[3] or 0),
+            }
+
+    def set_token_recovery_budget(self, cookie_id: str, attempts: int, hold_until: int, hold_reason: str = "") -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.execute(
+                    """UPDATE cookies
+                       SET token_recovery_attempts = ?, token_recovery_hold_until = ?, token_recovery_hold_reason = ?
+                       WHERE id = ?""",
+                    (int(attempts or 0), int(hold_until or 0), str(hold_reason or ""), cookie_id),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"写入Token恢复预算失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def clear_token_recovery_budget(self, cookie_id: str) -> bool:
+        """清零失败次数和停机窗口，保留稳定期复查标记。"""
+        with self.lock:
+            try:
+                cursor = self.conn.execute(
+                    """UPDATE cookies
+                       SET token_recovery_attempts = 0, token_recovery_hold_until = 0, token_recovery_hold_reason = ''
+                       WHERE id = ?""",
+                    (cookie_id,),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"清除Token恢复预算失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def mark_token_recovery_grace_rechecked(self, cookie_id: str) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.execute(
+                    "UPDATE cookies SET token_recovery_grace_rechecked = 1 WHERE id = ?",
+                    (cookie_id,),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"标记Token稳定期复查失败: {e}")
+                self.conn.rollback()
                 return False
 
     def update_cookie_pause_duration(self, cookie_id: str, pause_duration: int) -> bool:

@@ -34,6 +34,7 @@ from message_filter_service import message_filter_service
 from utils.qr_login import qr_login_manager
 from utils.qr_login_lite import qrcode_login_lite
 from utils.xianyu_utils import trans_cookies, resolve_headless_flag
+from utils.cookie_identity import cookies_equivalent
 from utils.image_utils import image_manager
 from utils.item_pagination import MAX_ITEM_LIST_PAGE_SIZE
 from utils.product_sku import ProductSkuValidationError, normalize_sku_config
@@ -4070,6 +4071,73 @@ def _is_runtime_timestamp_recent(value: Any, window_seconds: Any) -> bool:
     return (time.time() - timestamp) <= window
 
 
+def classify_account_health(status: Dict[str, Any]) -> Dict[str, Any]:
+    """A 离线 / B Token 续期降级或平台风控停机 / C 正常。连接还在时不得报账号离线。"""
+    token_status = str(status.get("token_refresh_status") or "")
+    connection = str(status.get("connection_state") or "")
+    ws_ready = bool(status.get("ws_ready"))
+    heartbeat_age = status.get("last_heartbeat_age_seconds")
+    heartbeat_stale = False
+    try:
+        if heartbeat_age is not None:
+            heartbeat_stale = int(heartbeat_age) > 300
+    except (TypeError, ValueError):
+        heartbeat_stale = False
+    offline = connection != "connected" or not ws_ready or heartbeat_stale
+    if token_status in ("platform_risk_hold", "token_recovery_manual_hold"):
+        summary = status.get("token_refresh_error_message") or (
+            "账号被平台风控，自动恢复已停止，重复扫码无效，请等待平台冷却后再处理"
+            if token_status == "platform_risk_hold"
+            else "Token自动恢复连续失败已达上限，已停止请求平台接口，需人工处理"
+        )
+        return {"health_grade": "B", "health_summary": summary, "alert_offline": False}
+    if connection == "connected" and not status.get("has_current_token"):
+        return {
+            "health_grade": "B",
+            "health_summary": "Token续期降级：连接正常但没有可用Token，建议在Token过期前扫码续期",
+            "alert_offline": False,
+        }
+    if not offline and token_status not in ("", "None", "success", "started"):
+        return {
+            "health_grade": "B",
+            "health_summary": "Token续期降级：连接正常，建议在Token过期前扫码续期",
+            "alert_offline": False,
+        }
+    if not offline:
+        return {"health_grade": "C", "health_summary": "账号在线", "alert_offline": False}
+    return {
+        "health_grade": "A",
+        "health_summary": "账号离线：连接未建立或心跳超时",
+        "alert_offline": True,
+    }
+
+
+def _apply_token_recovery_hold_status(status: Dict[str, Any], cookie_id: str) -> Dict[str, Any]:
+    """平台停机优先于“请扫码”文案，避免连接还在或风控停机被看成账号离线。"""
+    budget = {}
+    if cookie_id:
+        try:
+            budget = db_manager.get_token_recovery_budget(cookie_id) or {}
+        except Exception:
+            budget = {}
+    hold_until = int(budget.get("hold_until") or 0)
+    status["token_recovery_hold_until"] = hold_until
+    status["token_recovery_attempts"] = int(budget.get("attempts") or 0)
+    if hold_until > time.time():
+        if str(budget.get("hold_reason") or "") == "platform_punish":
+            status["token_refresh_status"] = "platform_risk_hold"
+            status["token_refresh_error_message"] = (
+                "账号被平台风控，自动恢复已停止。重复扫码无效，请等待平台冷却后再处理"
+            )
+        else:
+            status["token_refresh_status"] = "token_recovery_manual_hold"
+            status["token_refresh_error_message"] = (
+                "Token自动恢复连续失败已达上限，已停止请求平台接口，需人工处理"
+            )
+    status.update(classify_account_health(status))
+    return status
+
+
 def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     cleaned_cid = str(cookie_id or '').strip()
     runtime_status = {
@@ -4131,7 +4199,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'manual_browser_reason': None,
     }
     if not cleaned_cid:
-        return runtime_status
+        return _apply_token_recovery_hold_status(runtime_status, cleaned_cid)
 
     runtime_status['chat_verification_required'] = db_manager.get_chat_verification_required(cleaned_cid)
     if runtime_status['chat_verification_required']:
@@ -4152,7 +4220,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     except Exception as e:
         if not live_instance:
             runtime_status['error'] = f"import_failed: {mask_sensitive_text(e)}"
-            return runtime_status
+            return _apply_token_recovery_hold_status(runtime_status, cleaned_cid)
     else:
         if not live_instance:
             live_instance = XianyuLive.get_instance(cleaned_cid)
@@ -4160,7 +4228,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         runtime_status['auth_recovery_owner'] = (auth_recovery_state or {}).get('owner')
 
     if not live_instance:
-        return runtime_status
+        return _apply_token_recovery_hold_status(runtime_status, cleaned_cid)
 
     connection_state = getattr(live_instance, 'connection_state', None)
     connection_state_value = getattr(connection_state, 'value', str(connection_state or 'unknown'))
@@ -4431,7 +4499,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'manual_browser_session_status': manual_browser_status,
         'manual_browser_reason': manual_browser_reason,
     })
-    return runtime_status
+    return _apply_token_recovery_hold_status(runtime_status, cleaned_cid)
 
 
 async def _run_live_instance_on_manager_loop(
@@ -6464,6 +6532,48 @@ def _clear_login_backoffs_for_qr_success(account_id: str, current_user: Dict[str
     log_with_user('info', f"扫码成功，已清空账号全部进程内退避与失败计数: {account_id}", current_user)
 
 
+async def _prepare_qr_token_prewarm(account_id: str, cookies: str, proxy=None, notifier=None) -> Dict[str, Any]:
+    """扫码落库后先探一次 Token。风控则停机且不交接；成功才预热；没结论就延迟首轮预检。"""
+    from XianyuAutoAsync import XianyuLive
+
+    settle = float(RISK_CONTROL.get("token_preflight_settle_seconds", 5) or 5)
+    outcome = {
+        "token_prewarmed": False,
+        "authorize_handoff": True,
+        "platform_punish": False,
+        "warning_message": None,
+    }
+    try:
+        probe = await XianyuLive.prewarm_token_from_cookie(
+            account_id, cookies, proxy=proxy, source="qr_login"
+        )
+    except Exception:
+        logger.warning(f"扫码Token预热异常，改为延迟首次预检: {account_id}")
+        XianyuLive.defer_initial_token_preflight(account_id, settle)
+        return outcome
+    if probe.get("platform_punish"):
+        XianyuLive.persist_token_recovery_hold(account_id, reason="platform_punish")
+        outcome["platform_punish"] = True
+        outcome["authorize_handoff"] = False
+        outcome["warning_message"] = XianyuLive.PLATFORM_PUNISH_MESSAGE
+        if notifier is not None:
+            try:
+                await notifier.send_token_refresh_notification(outcome["warning_message"], "platform_risk_hold")
+            except Exception:
+                pass
+        logger.warning(f"{outcome['warning_message']}: {account_id}")
+        return outcome
+    if probe.get("cached"):
+        try:
+            db_manager.clear_token_recovery_budget(account_id)
+        except Exception:
+            pass
+        outcome["token_prewarmed"] = True
+        return outcome
+    XianyuLive.defer_initial_token_preflight(account_id, settle)
+    return outcome
+
+
 async def _hot_reload_after_qr_success(
     account_id: str,
     cookie_value: str,
@@ -6471,6 +6581,7 @@ async def _hot_reload_after_qr_success(
     is_new_account: bool,
     current_user: Dict[str, Any],
     user_id: int = None,
+    authorize_handoff: bool = True,
 ) -> bool:
     """扫码成功后的统一热重载：先清退避 → 进程内切换实例 → 切换完成后再清一次退避 → 登记补发巡检。
 
@@ -6485,9 +6596,15 @@ async def _hot_reload_after_qr_success(
         log_with_user('warning', f"真实Cookie已获取，但任务管理器未初始化，未启动账号任务: {account_id}", current_user)
         return False
 
-    if not XianyuLive.authorize_chat_handoff(account_id, cookie_value):
-        log_with_user('info', f"忽略已被更新凭证取代的扫码回调: {account_id}", current_user)
-        return False
+    if authorize_handoff:
+        if not XianyuLive.authorize_chat_handoff(account_id, cookie_value):
+            log_with_user('info', f"忽略已被更新凭证取代的扫码回调: {account_id}", current_user)
+            return False
+    else:
+        persisted_cookie = db_manager.get_cookie(account_id)
+        if persisted_cookie is not None and not cookies_equivalent(persisted_cookie, cookie_value):
+            log_with_user('info', f"忽略已被更新凭证取代的扫码回调: {account_id}", current_user)
+            return False
     _clear_login_backoffs_for_qr_success(account_id, current_user)
 
     switch_handle = None
@@ -6511,7 +6628,7 @@ async def _hot_reload_after_qr_success(
             return False
 
     persisted_cookie = db_manager.get_cookie(account_id)
-    if persisted_cookie is not None and persisted_cookie != cookie_value:
+    if persisted_cookie is not None and not cookies_equivalent(persisted_cookie, cookie_value):
         return False
     XianyuLive.clear_class_level_backoffs(account_id)
     XianyuLive.request_post_qr_delivery_patrol(account_id)
@@ -6615,39 +6732,59 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     qr_login_grace_until = int(time.time() + (qr_login_grace_minutes * 60))
                     task_restarted = False
                     warning_message = None
+                    token_prewarmed = False
                     final_cookies = temp_instance.cookies_str or real_cookies
+                    prewarm = await _prepare_qr_token_prewarm(
+                        account_id,
+                        final_cookies,
+                        proxy=getattr(temp_instance, 'proxy_config', None),
+                        notifier=temp_instance,
+                    )
+                    token_prewarmed = bool(prewarm.get('token_prewarmed'))
+                    platform_punish = bool(prewarm.get('platform_punish'))
+                    if prewarm.get('warning_message'):
+                        warning_message = prewarm['warning_message']
 
                     try:
                         if cookie_manager.manager:
                             # 扫码成功=最高优先级人工授权。统一走热重载：
                             # 先清全部退避 → 进程内切换实例 → 切换完成后二次清退避 → 登记补发巡检。
+                            # 平台风控时不交接，避免新实例把验证标记清掉后又立刻打 Token。
                             task_restarted = await _hot_reload_after_qr_success(
                                 account_id,
                                 final_cookies,
                                 is_new_account=is_new_account,
                                 current_user=current_user,
                                 user_id=user_id,
+                                authorize_handoff=bool(prewarm.get('authorize_handoff', True)),
                             )
-                            if task_restarted and db_manager.get_cookie(account_id) != final_cookies:
+                            stored_cookie = db_manager.get_cookie(account_id) or ''
+                            if task_restarted and not cookies_equivalent(stored_cookie, final_cookies):
                                 task_restarted = False
                                 warning_message = '本次扫码已被更新的凭证取代，保持当前账号状态'
-                            if task_restarted:
+                            if task_restarted and not platform_punish:
                                 db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
                                 XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
                                 warning_message = f"真实Cookie已获取，已提供一次聊天恢复机会；{qr_login_grace_minutes} 分钟稳定期继续限制后台重复认证"
                                 log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                        else:
+                            elif task_restarted and warning_message:
+                                log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        elif not platform_punish:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as task_switch_e:
-                        if db_manager.get_cookie(account_id) == final_cookies:
+                        if cookies_equivalent(db_manager.get_cookie(account_id) or '', final_cookies) and not platform_punish:
                             db_manager.set_cookie_qr_login_grace_until(account_id, 0)
                             XianyuLive.clear_qr_login_grace(account_id)
-                        warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
-                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        if not platform_punish:
+                            warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
-                    if not task_restarted and db_manager.get_cookie(account_id) != final_cookies:
+                    stored_cookie = db_manager.get_cookie(account_id) or ''
+                    if not task_restarted and not cookies_equivalent(stored_cookie, final_cookies):
                         warning_message = '本次扫码已被更新的凭证取代，保持当前账号状态'
+                    elif not task_restarted and platform_punish:
+                        pass
                     elif not task_restarted:
                         db_manager.set_cookie_qr_login_grace_until(account_id, 0)
                         XianyuLive.clear_qr_login_grace(account_id)
@@ -6667,8 +6804,11 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     if risk_log_id:
                         try:
                             if task_restarted:
-                                processing_result = '扫码登录真实Cookie获取成功，账号任务已启动'
-                                processing_result += f'；已提供一次聊天恢复机会，{qr_login_grace_minutes} 分钟稳定期抑制后台重复认证'
+                                if platform_punish:
+                                    processing_result = warning_message or '平台返回账号级风控，自动恢复已停止'
+                                else:
+                                    processing_result = '扫码登录真实Cookie获取成功，账号任务已启动'
+                                    processing_result += f'；已提供一次聊天恢复机会，{qr_login_grace_minutes} 分钟稳定期抑制后台重复认证'
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
                                     processing_status='success',
@@ -6681,7 +6821,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                         'account_id': account_id,
                                         'is_new_account': is_new_account,
                                         'task_restarted': task_restarted,
-                                        'token_prewarmed': False,
+                                        'token_prewarmed': token_prewarmed,
                                     })
                                 )
                             else:
@@ -6698,7 +6838,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                         'account_id': account_id,
                                         'is_new_account': is_new_account,
                                         'task_restarted': task_restarted,
-                                        'token_prewarmed': False,
+                                        'token_prewarmed': token_prewarmed,
                                     })
                                 )
                         except Exception:
@@ -6709,7 +6849,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         'is_new_account': is_new_account,
                         'real_cookie_refreshed': task_restarted,  # 回滚时为 False，成功切换时为 True
                         'cookie_length': len(final_cookies),
-                        'token_prewarmed': False,
+                        'token_prewarmed': token_prewarmed,
                         'task_restarted': task_restarted,
                         'warning_message': warning_message
                     }
@@ -6793,6 +6933,7 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
         if not saved:
             raise RuntimeError("扫码 Cookie 保存失败，未启动聊天恢复")
 
+        prewarm = await _prepare_qr_token_prewarm(account_id, cookies)
         # 添加到或更新cookie_manager：降级保存同样走统一热重载（清退避→切换→二次清退避→登记补发巡检）
         if cookie_manager.manager:
             await _hot_reload_after_qr_success(
@@ -6800,6 +6941,7 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
                 cookies,
                 is_new_account=is_new_account,
                 current_user=current_user,
+                authorize_handoff=bool(prewarm.get('authorize_handoff', True)),
             )
 
         return {
@@ -6807,7 +6949,9 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
             'is_new_account': is_new_account,
             'real_cookie_refreshed': False,
             'fallback_reason': error_reason,
-            'cookie_length': len(cookies)
+            'cookie_length': len(cookies),
+            'token_prewarmed': bool(prewarm.get('token_prewarmed')),
+            'warning_message': prewarm.get('warning_message'),
         }
 
     except Exception as fallback_e:
@@ -6898,21 +7042,33 @@ async def refresh_cookies_from_qr_login(
                     pass
 
             # 如果cookie_manager存在：手动扫码刷新同样走统一热重载（清退避→切换→二次清退避→登记补发巡检）
+            token_prewarmed = False
+            punish_message = None
             if cookie_manager.manager:
                 updated_cookie_info = db_manager.get_cookie_by_id(cookie_id)
                 if updated_cookie_info:
                     # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
+                    prewarm = await _prepare_qr_token_prewarm(
+                        cookie_id,
+                        updated_cookie_info['cookies_str'],
+                        proxy=getattr(temp_instance, 'proxy_config', None),
+                        notifier=temp_instance,
+                    )
+                    token_prewarmed = bool(prewarm.get('token_prewarmed'))
+                    punish_message = prewarm.get('warning_message')
                     await _hot_reload_after_qr_success(
                         cookie_id,
                         updated_cookie_info['cookies_str'],
                         is_new_account=False,
                         current_user=current_user,
+                        authorize_handoff=bool(prewarm.get('authorize_handoff', True)),
                     )
 
             return {
                 'success': True,
-                'message': '真实cookie获取并保存成功',
-                'cookie_id': cookie_id
+                'message': punish_message or '真实cookie获取并保存成功',
+                'cookie_id': cookie_id,
+                'token_prewarmed': token_prewarmed,
             }
         else:
             log_with_user('error', f"扫码cookie刷新失败: {cookie_id}", current_user)

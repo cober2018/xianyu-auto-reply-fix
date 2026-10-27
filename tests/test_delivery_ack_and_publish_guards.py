@@ -43,7 +43,14 @@ def _live():
     live._fulfillment_priority_depth = 0
     live.last_token_refresh_status = ""
     live.last_token_refresh_error_message = ""
+    live._ready_websockets = set()
     return live
+
+
+def _ready(live, socket):
+    """回执测试只覆盖送达确认；连接必须先登记为业务就绪，否则发送守卫会直接拒绝。"""
+    live._ready_websockets.add(socket)
+    return socket
 
 
 class SendAckTests(unittest.TestCase):
@@ -56,7 +63,7 @@ class SendAckTests(unittest.TestCase):
 
     def test_shared_socket_waits_for_matching_ack(self):
         live = _live()
-        socket = _SharedSocket()
+        socket = _ready(live, _SharedSocket())
         live.ws = socket
 
         async def scenario():
@@ -75,7 +82,7 @@ class SendAckTests(unittest.TestCase):
 
     def test_shared_socket_error_receipt_is_not_success(self):
         live = _live()
-        socket = _SharedSocket()
+        socket = _ready(live, _SharedSocket())
         live.ws = socket
 
         async def scenario():
@@ -93,7 +100,7 @@ class SendAckTests(unittest.TestCase):
 
     def test_shared_socket_timeout_raises(self):
         live = _live()
-        socket = _SharedSocket()
+        socket = _ready(live, _SharedSocket())
         live.ws = socket
 
         async def scenario():
@@ -111,10 +118,10 @@ class SendAckTests(unittest.TestCase):
             mid = json.loads(socket.sent[0])["headers"]["mid"]
             return json.dumps({"code": 200, "headers": {"mid": mid}})
 
-        socket = _DedicatedSocket([
+        socket = _ready(live, _DedicatedSocket([
             json.dumps({"code": 200, "headers": {"mid": "other"}}),
             success_frame,
-        ])
+        ]))
 
         self.assertTrue(asyncio.run(live.send_msg(socket, "cid", "buyer", "链接")))
 
@@ -126,7 +133,7 @@ class SendAckTests(unittest.TestCase):
             mid = json.loads(socket.sent[0])["headers"]["mid"]
             return json.dumps({"code": 400, "headers": {"mid": mid}})
 
-        socket = _DedicatedSocket([error_frame])
+        socket = _ready(live, _DedicatedSocket([error_frame]))
         with self.assertRaises(MessageSendAckTimeoutError):
             asyncio.run(live.send_msg(socket, "cid", "buyer", "链接"))
 
@@ -241,7 +248,7 @@ class ImageSendAckTests(unittest.TestCase):
     def test_shared_socket_image_waits_for_ack(self):
         live = _live()
         live._safe_str = str
-        socket = _SharedSocket()
+        socket = _ready(live, _SharedSocket())
         live.ws = socket
 
         async def scenario():
@@ -263,7 +270,7 @@ class ImageSendAckTests(unittest.TestCase):
     def test_shared_socket_image_timeout_and_error_are_not_success(self):
         live = _live()
         live._safe_str = str
-        socket = _SharedSocket()
+        socket = _ready(live, _SharedSocket())
         live.ws = socket
 
         async def timeout_scenario():
@@ -273,7 +280,7 @@ class ImageSendAckTests(unittest.TestCase):
         with self.assertRaises(MessageSendAckTimeoutError):
             asyncio.run(timeout_scenario())
 
-        error_socket = _SharedSocket()
+        error_socket = _ready(live, _SharedSocket())
         live.ws = error_socket
 
         async def error_scenario():

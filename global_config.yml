@@ -80,6 +80,13 @@ RISK_CONTROL:
   post_slider_retry_delay_min: 5.0
   token_refresh_dedup_window_seconds: 60
   token_retry_min_wait_seconds: 180
+  # Token 预检连续失败退避（秒）：10分钟 → 30分钟 → 2小时，达到次数或命中账号级风控后停止
+  token_recovery_backoff_schedule_seconds: [600, 1800, 7200]
+  token_recovery_max_attempts: 5
+  # 停止后再过这么多秒才允许重新开始一轮预算，避免平台冷却结束后永久卡死
+  token_recovery_hold_seconds: 21600
+  # 扫码成功但没预热到 Token 时，新实例首次预检前等待秒数
+  token_preflight_settle_seconds: 5
   # 拟人化：付款到自动发货之间的随机延迟区间(秒)，秒发是机器人签名
   auto_delivery_delay_range: [20, 90]
   # 拟人化：夜间窗口内发货延迟拉长(秒)，真人卖家凌晨处理更慢

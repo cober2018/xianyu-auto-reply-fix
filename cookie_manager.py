@@ -3,6 +3,7 @@ import asyncio
 from typing import Dict, List, Tuple, Optional
 from loguru import logger
 from db_manager import db_manager
+from utils.cookie_identity import cookies_equivalent
 
 __all__ = ["CookieManager", "manager"]
 
@@ -123,7 +124,7 @@ class CookieManager:
         
         async with self._task_locks[cookie_id]:
             persisted_cookie = db_manager.get_cookie(cookie_id)
-            if persisted_cookie is not None and persisted_cookie != cookie_value:
+            if persisted_cookie is not None and not cookies_equivalent(persisted_cookie, cookie_value):
                 logger.warning(f"【{cookie_id}】忽略已过期的凭证启动请求")
                 return
             # 检查是否已存在任务
@@ -152,7 +153,7 @@ class CookieManager:
                     logger.info(f"【{cookie_id}】旧任务已完成，已移除")
             
             persisted_cookie = db_manager.get_cookie(cookie_id)
-            if persisted_cookie is not None and persisted_cookie != cookie_value:
+            if persisted_cookie is not None and not cookies_equivalent(persisted_cookie, cookie_value):
                 logger.warning(f"【{cookie_id}】忽略已被新凭证取代的启动请求")
                 return
             self.cookies[cookie_id] = cookie_value
@@ -260,7 +261,7 @@ class CookieManager:
                 self._task_locks[cookie_id] = asyncio.Lock()
             
             async with self._task_locks[cookie_id]:
-                if not save_to_db and db_manager.get_cookie(cookie_id) != new_value:
+                if not save_to_db and not cookies_equivalent(db_manager.get_cookie(cookie_id), new_value):
                     logger.warning(f"【{cookie_id}】忽略已过期的凭证切换请求")
                     return
                 # 获取原有的user_id和关键词
@@ -301,7 +302,7 @@ class CookieManager:
                     logger.info(f"【{cookie_id}】旧任务已停止")
 
                 # 更新Cookie值
-                if not save_to_db and db_manager.get_cookie(cookie_id) != new_value:
+                if not save_to_db and not cookies_equivalent(db_manager.get_cookie(cookie_id), new_value):
                     logger.warning(f"【{cookie_id}】忽略已被新凭证取代的交接")
                     return
                 self.cookies[cookie_id] = new_value
