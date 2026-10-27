@@ -38,6 +38,7 @@ from utils.cookie_identity import (
     cookie_identity_fingerprint,
     cookie_identity_map,
     cookies_equivalent,
+    parse_cookie_pairs,
 )
 from utils.notification_dispatcher import (
     build_face_verify_notification,
@@ -563,18 +564,89 @@ class XianyuLive:
         cls._auth_prewarmed_tokens.pop(cookie_id, None)
 
     @staticmethod
-    def response_is_platform_punish(payload) -> bool:
+    def _response_text(payload) -> str:
         if payload is None:
-            return False
+            return ""
         if isinstance(payload, str):
-            text = payload
-        else:
-            try:
-                text = json.dumps(payload, ensure_ascii=False)
-            except Exception:
-                text = str(payload)
+            return payload
+        parts = []
+        if isinstance(payload, dict):
+            ret_value = payload.get("ret")
+            if isinstance(ret_value, str):
+                parts.append(ret_value)
+            elif isinstance(ret_value, (list, tuple)):
+                parts.append(" | ".join(str(item) for item in ret_value))
+        try:
+            parts.append(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            parts.append(str(payload))
+        return "\n".join(part for part in parts if part)
+
+    @staticmethod
+    def response_is_platform_punish(payload) -> bool:
+        text = XianyuLive._response_text(payload)
         markers = ("RGV587_ERROR", "FAIL_SYS_USER_VALIDATE", "_____tmd_____/punish", "punish?x5secdata")
         return any(marker in text for marker in markers)
+
+    @staticmethod
+    def response_is_h5_token_expired(payload) -> bool:
+        """签名用的 _m_h5_tk 过期。平台拼写是 EXOIRED，也接受 EXPIRED。这不是账号级风控。"""
+        text = XianyuLive._response_text(payload)
+        return any(marker in text for marker in ("FAIL_SYS_TOKEN_EXOIRED", "FAIL_SYS_TOKEN_EXPIRED"))
+
+    @staticmethod
+    def _cookie_with_h5_updates(base_cookie: str, updates: Optional[Dict[str, Any]]) -> str:
+        pairs = parse_cookie_pairs(base_cookie)
+        changed = False
+        for key in ("_m_h5_tk", "_m_h5_tk_enc"):
+            value = str((updates or {}).get(key) or "").strip()
+            if value and pairs.get(key) != value:
+                pairs[key] = value
+                changed = True
+        if not changed:
+            return base_cookie
+        return "; ".join(f"{key}={value}" for key, value in pairs.items())
+
+    @classmethod
+    def persist_refreshed_h5_cookie(cls, cookie_id: str, refreshed_cookie: str) -> str:
+        """把同一账号换到的 _m_h5_tk 写回数据库。unb 或 cookie2 变了就拒绝。"""
+        if not cookie_id or not refreshed_cookie:
+            return ""
+        try:
+            stored = db_manager.get_cookie(cookie_id)
+        except Exception:
+            return ""
+        if not stored:
+            return ""
+        stored_pairs = parse_cookie_pairs(stored)
+        incoming = parse_cookie_pairs(refreshed_cookie)
+        if not stored_pairs.get("unb") or stored_pairs.get("unb") != incoming.get("unb"):
+            return ""
+        if not stored_pairs.get("cookie2") or stored_pairs.get("cookie2") != incoming.get("cookie2"):
+            return ""
+        merged = cls._cookie_with_h5_updates(stored, incoming)
+        if merged == stored:
+            return stored
+        try:
+            saved = db_manager.update_cookie_account_info(
+                cookie_id, cookie_value=merged, expected_cookie=stored
+            )
+        except Exception:
+            return ""
+        return merged if saved else ""
+
+    def _adopt_refreshed_probe_cookie(self, cookies_str: str) -> str:
+        current = str(getattr(self, "cookies_str", "") or "")
+        if not cookies_str:
+            return current
+        if parse_cookie_pairs(cookies_str).get("_m_h5_tk") == parse_cookie_pairs(current).get("_m_h5_tk"):
+            return current
+        adopted = self.persist_refreshed_h5_cookie(self.cookie_id, cookies_str)
+        if not adopted:
+            return current
+        self._set_runtime_cookie_state(cookies_str=adopted, source="h5_token_refresh")
+        self._persisted_cookie_value = adopted
+        return adopted
 
     @staticmethod
     def plan_token_recovery_failure(attempt, *, terminal=False, now=None, schedule=None, max_attempts=None, hold_seconds=None) -> dict:
@@ -708,7 +780,7 @@ class XianyuLive:
     @classmethod
     async def prewarm_token_from_cookie(cls, cookie_id, cookies_str, proxy=None, source="qr_login"):
         """扫码成功后打一次 Token 预检。命中风控不缓存，成功才交给新实例复用。"""
-        from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
+        from utils.xianyu_slider_stealth import merge_h5_cookie_text, probe_cookie_verification_from_cookie
 
         result = {
             "cached": False,
@@ -716,6 +788,9 @@ class XianyuLive:
             "platform_punish": False,
             "token": None,
             "verification_url": None,
+            "h5_token_refreshed": False,
+            "h5_token_expired": False,
+            "cookies_str": cookies_str,
         }
         try:
             probe = await asyncio.to_thread(
@@ -730,8 +805,14 @@ class XianyuLive:
         payload = probe.get("payload") if isinstance(probe, dict) else None
         status = (probe or {}).get("status") or "unknown"
         verification_url = (probe or {}).get("verification_url")
+        refreshed_cookie = cookies_str
+        if (probe or {}).get("h5_token_refreshed"):
+            refreshed_cookie = merge_h5_cookie_text(cookies_str, (probe or {}).get("session_cookies") or {})
         result["status"] = status
         result["verification_url"] = verification_url
+        result["h5_token_refreshed"] = bool((probe or {}).get("h5_token_refreshed"))
+        result["h5_token_expired"] = bool((probe or {}).get("h5_token_expired"))
+        result["cookies_str"] = refreshed_cookie
         if cls.response_is_platform_punish(payload) or cls.response_is_platform_punish(verification_url):
             result["platform_punish"] = True
             result["status"] = "platform_punish"
@@ -739,13 +820,17 @@ class XianyuLive:
         data = payload.get("data") if isinstance(payload, dict) else None
         token = str((data or {}).get("accessToken") or "").strip() if isinstance(data, dict) else ""
         if status == "cookie_valid" and token:
-            cls.cache_auth_prewarmed_token(cookie_id, token, source=source, cookies_str=cookies_str)
+            cls.cache_auth_prewarmed_token(cookie_id, token, source=source, cookies_str=refreshed_cookie)
+            if refreshed_cookie != cookies_str:
+                cached = cls._auth_prewarmed_tokens.get(cookie_id)
+                if cached is not None:
+                    cached["legacy_fingerprint"] = cookie_full_fingerprint(cookies_str)
             result["cached"] = True
             result["token"] = token
         return result
 
     async def _maybe_recheck_token_after_qr_grace(self):
-        """稳定期结束后，验证标记仍在且 Cookie 未再变时，只做一次预检。"""
+        """稳定期结束后，验证标记仍在时再预检。只有成功才记完成；失败按上限重试。"""
         if self._get_qr_login_grace_remaining_seconds() > 0:
             return
         try:
@@ -754,17 +839,11 @@ class XianyuLive:
             budget = db_manager.get_token_recovery_budget(self.cookie_id) or {}
         except Exception:
             return
-        if int(budget.get("grace_rechecked") or 0):
-            return
         if self._token_recovery_hold_active():
-            try:
-                db_manager.mark_token_recovery_grace_rechecked(self.cookie_id)
-            except Exception:
-                pass
             return
-        try:
-            db_manager.mark_token_recovery_grace_rechecked(self.cookie_id)
-        except Exception:
+        max_attempts = max(1, int(RISK_CONTROL.get("token_recovery_grace_recheck_max_attempts", 3) or 3))
+        failures = int(budget.get("grace_recheck_failures") or 0)
+        if failures >= max_attempts:
             return
         probe = await self.prewarm_token_from_cookie(
             self.cookie_id,
@@ -772,6 +851,10 @@ class XianyuLive:
             proxy=getattr(self, "proxy_config", None),
             source="qr_grace_recheck",
         )
+        if probe.get("h5_token_refreshed") and probe.get("cookies_str"):
+            adopted = self._adopt_refreshed_probe_cookie(probe["cookies_str"])
+            if adopted:
+                self.cookies_str = adopted
         if probe.get("platform_punish"):
             try:
                 self.persist_token_recovery_hold(self.cookie_id, reason="platform_punish")
@@ -786,6 +869,19 @@ class XianyuLive:
                 pass
             return
         if not (probe.get("cached") and probe.get("token")):
+            reason = "h5_token_expired" if probe.get("h5_token_expired") else str(probe.get("status") or "inconclusive")
+            try:
+                attempt = db_manager.record_token_recovery_grace_recheck_failure(self.cookie_id, reason)
+            except Exception:
+                attempt = failures + 1
+            if attempt >= max_attempts:
+                logger.warning(
+                    f"【{self.cookie_id}】扫码稳定期结束预检连续失败已达{max_attempts}次，停止自动重检"
+                )
+            else:
+                logger.warning(
+                    f"【{self.cookie_id}】扫码稳定期结束预检未通过({reason})，第{attempt}次，稍后重试"
+                )
             return
         try:
             cleared = db_manager.set_chat_verification_required(
@@ -803,6 +899,7 @@ class XianyuLive:
         self.pop_auth_prewarmed_token(self.cookie_id)
         try:
             db_manager.clear_token_recovery_budget(self.cookie_id)
+            db_manager.mark_token_recovery_grace_rechecked(self.cookie_id)
         except Exception:
             pass
         logger.info(f"【{self.cookie_id}】扫码稳定期结束预检通过，已清除聊天验证标记")
@@ -9827,7 +9924,8 @@ class XianyuLive:
     async def _refresh_token_impl(self, captcha_retry_count: int = 0, post_slider_session_grace_used: bool = False,
                                   allow_password_login_recovery: bool = True,
                                   manual_refresh_browser_stabilization_used: bool = False,
-                                  post_slider_session_retry_count: int = 0):
+                                  post_slider_session_retry_count: int = 0,
+                                  h5_token_retry_used: bool = False):
         """刷新token
 
         Args:
@@ -10029,7 +10127,31 @@ class XianyuLive:
                     # 检查是否包含"令牌过期"或"Session过期"
                     if isinstance(res_json, dict):
                         res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-                        if '令牌过期' in res_json_str or 'Session过期' in res_json_str:
+                        if (
+                            '令牌过期' in res_json_str
+                            or 'Session过期' in res_json_str
+                            or self.response_is_h5_token_expired(res_json)
+                            or 'FAIL_SYS_SESSION_EXPIRED' in res_json_str
+                        ):
+                            new_h5 = str((response_set_cookies or {}).get('_m_h5_tk') or '').strip()
+                            old_h5 = str(parse_cookie_pairs(self.cookies_str).get('_m_h5_tk') or '').strip()
+                            if (not h5_token_retry_used
+                                    and self.response_is_h5_token_expired(res_json)
+                                    and new_h5 and new_h5 != old_h5):
+                                merged = self._cookie_with_h5_updates(self.cookies_str, response_set_cookies)
+                                persisted = self.persist_refreshed_h5_cookie(self.cookie_id, merged)
+                                if persisted:
+                                    self._set_runtime_cookie_state(cookies_str=persisted, source="h5_token_refresh")
+                                    self._persisted_cookie_value = persisted
+                                    logger.info(f"【{self.cookie_id}】签名令牌已过期，已换新 _m_h5_tk 后重试一次")
+                                    return await self._refresh_token_impl(
+                                        captcha_retry_count=captcha_retry_count,
+                                        post_slider_session_grace_used=post_slider_session_grace_used,
+                                        allow_password_login_recovery=allow_password_login_recovery,
+                                        manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
+                                        post_slider_session_retry_count=post_slider_session_retry_count,
+                                        h5_token_retry_used=True,
+                                    )
                             # 记录令牌/Session过期到风控日志
                             token_expired_log_id = None
                             token_expired_session_id = self._new_risk_session_id('token')
@@ -10250,12 +10372,13 @@ class XianyuLive:
             return None
 
     def _need_captcha_verification(self, res_json: dict) -> bool:
+        """滑块/处罚页。与 response_is_platform_punish 用同一套处罚标记；纯令牌过期不是滑块。"""
         if not isinstance(res_json, dict):
             return False
-        ret = res_json.get('ret') or []
-        ret_text = ret if isinstance(ret, str) else ' | '.join(map(str, ret))
-        if any(marker in ret_text for marker in ('FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR')):
+        if self.response_is_platform_punish(res_json):
             return True
+        if self.response_is_h5_token_expired(res_json):
+            return False
         data = res_json.get('data') or {}
         url = str(data.get('url') or '') if isinstance(data, dict) else ''
         return any(marker in url.lower() for marker in ('punish', 'captcha', 'validate'))

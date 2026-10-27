@@ -11,10 +11,16 @@ from utils.slider_orchestrator import (
 
 
 class _FakeTokenRefreshResponse:
-    def __init__(self):
+    def __init__(self, payload=None):
         self.status = 200
         self.headers = {}
         self.json_content_type = object()
+        self.payload = payload or {
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "accessToken": "oauth_access_token",
+            },
+        }
 
     async def __aenter__(self):
         return self
@@ -24,12 +30,7 @@ class _FakeTokenRefreshResponse:
 
     async def json(self, content_type=None):
         self.json_content_type = content_type
-        return {
-            "ret": ["SUCCESS::调用成功"],
-            "data": {
-                "accessToken": "oauth_access_token",
-            },
-        }
+        return self.payload
 
 
 class _FakeSession:
@@ -199,6 +200,73 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         request = fake_session.post_calls[0]
         self.assertEqual(request["kwargs"]["proxy"], "http://127.0.0.1:8888")
         self.assertEqual(fake_response.json_content_type, None)
+
+    def test_token_expiry_code_is_backoff_not_captcha_or_punish(self):
+        live = XianyuLive.__new__(XianyuLive)
+        expired = {"ret": ["FAIL_SYS_TOKEN_EXOIRED"]}
+        punish = {
+            "ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM"],
+            "data": {"url": "https://example.invalid/_____tmd_____/punish?x5secdata=1"},
+        }
+        captcha_only = {"ret": ["FAIL"], "data": {"url": "https://example.invalid/captcha"}}
+
+        self.assertTrue(XianyuLive.response_is_h5_token_expired(expired))
+        self.assertFalse(XianyuLive.response_is_platform_punish(expired))
+        self.assertFalse(live._need_captcha_verification(expired))
+        self.assertTrue(XianyuLive.response_is_platform_punish(punish))
+        self.assertTrue(live._need_captcha_verification(punish))
+        self.assertFalse(XianyuLive.response_is_platform_punish(captcha_only))
+        self.assertTrue(live._need_captcha_verification(captcha_only))
+
+    async def test_bare_token_expiry_code_is_recorded_as_backoff_failure(self):
+        payload = {"ret": ["FAIL_SYS_TOKEN_EXOIRED"], "data": {}}
+        fake_response = _FakeTokenRefreshResponse(payload)
+        fake_session = _FakeSession(fake_response)
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "token_expiry_backoff_test"
+        live.session = fake_session
+        live._http_proxy_url = None
+        live.device_id = "device-id"
+        live.cookies_str = "unb=1; cookie2=c; _m_h5_tk=oldtoken123_111"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 0
+        live.max_captcha_verification_count = 3
+        live.last_token_refresh_status = None
+        live.last_token_refresh_error_message = None
+        live.restarted_in_browser_refresh = False
+        live.init_auth_failures = 0
+        live.last_init_failure_reason = None
+        live.last_init_failure_type = None
+        live._skip_db_cookie_reload_for_token_refresh = True
+        live.last_slider_success_at = 0
+        live.pending_slider_success_notice = None
+        recorded = {}
+
+        async def record_failure(reason, terminal=False):
+            recorded["reason"] = reason
+            recorded["terminal"] = terminal
+
+        live.create_session = mock.AsyncMock()
+        live._reload_latest_cookies_from_db = lambda *_args, **_kwargs: None
+        live._extract_set_cookie_updates = lambda headers: {}
+        live._build_cookie_string_with_updates = lambda cookie_string, updates: cookie_string
+        live._record_token_probe_failure = record_failure
+        live.send_token_refresh_notification = mock.AsyncMock()
+        live._pause_chat_for_verification = mock.AsyncMock()
+
+        with mock.patch("XianyuAutoAsync.db_manager.mark_stale_risk_control_logs_failed", return_value=0), \
+                mock.patch("XianyuAutoAsync.db_manager.add_risk_control_log", return_value=1), \
+                mock.patch("XianyuAutoAsync.db_manager.update_risk_control_log", return_value=True), \
+                mock.patch("XianyuAutoAsync.db_manager.get_chat_verification_required", return_value=False):
+            token = await live._refresh_token_impl(allow_password_login_recovery=False)
+
+        self.assertIsNone(token)
+        self.assertEqual(recorded["reason"], "session_expired_recovery_failed")
+        self.assertFalse(recorded["terminal"])
+        self.assertNotEqual(live.last_token_refresh_status, "token_refresh_failed")
+        live._pause_chat_for_verification.assert_not_awaited()
 
     async def test_handle_captcha_verification_marks_slider_scene_as_token_refresh(self):
         created_sliders = []

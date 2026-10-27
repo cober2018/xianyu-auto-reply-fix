@@ -142,6 +142,66 @@ def build_cookie_verification_sign(ts: str, token: str, data: str) -> str:
     return hashlib.md5(f"{token}&{ts}&34839810&{data}".encode("utf-8")).hexdigest()
 
 
+_H5_TOKEN_EXPIRED_MARKERS = ("FAIL_SYS_TOKEN_EXOIRED", "FAIL_SYS_TOKEN_EXPIRED")
+_H5_COOKIE_FIELDS = ("_m_h5_tk", "_m_h5_tk_enc")
+
+
+def payload_is_h5_token_expired(payload) -> bool:
+    """平台原文把 EXPIRED 拼成 EXOIRED，两种都算签名令牌过期，不是账号级处罚。"""
+    if isinstance(payload, str):
+        text = payload
+    elif isinstance(payload, dict):
+        ret_value = payload.get("ret") or []
+        text = ret_value if isinstance(ret_value, str) else " | ".join(str(item) for item in ret_value)
+    else:
+        text = ""
+    return any(marker in text for marker in _H5_TOKEN_EXPIRED_MARKERS)
+
+
+def merge_h5_cookie_text(cookie_text: str, updates: Optional[Dict[str, Any]]) -> str:
+    pairs = parse_cookie_string(cookie_text)
+    changed = False
+    for key in _H5_COOKIE_FIELDS:
+        value = str((updates or {}).get(key) or "").strip()
+        if value and pairs.get(key) != value:
+            pairs[key] = value
+            changed = True
+    if not changed:
+        return cookie_text
+    return "; ".join(f"{key}={value}" for key, value in pairs.items())
+
+
+def _h5_updates_from_response(response, session_cookies: Dict[str, Any]) -> Dict[str, str]:
+    updates: Dict[str, str] = {}
+    for key in _H5_COOKIE_FIELDS:
+        value = str((session_cookies or {}).get(key) or "").strip()
+        if value:
+            updates[key] = value
+    headers = getattr(response, "headers", None) or {}
+    raw_values = []
+    try:
+        if hasattr(headers, "getlist"):
+            raw_values.extend(headers.getlist("Set-Cookie") or [])
+        elif hasattr(headers, "get_all"):
+            raw_values.extend(headers.get_all("Set-Cookie") or [])
+    except Exception:
+        raw_values = []
+    raw = headers.get("Set-Cookie") or headers.get("set-cookie") if hasattr(headers, "get") else None
+    if isinstance(raw, list):
+        raw_values.extend(raw)
+    elif raw:
+        raw_values.append(raw)
+    for cookie in raw_values:
+        text = str(cookie or "")
+        if "=" not in text:
+            continue
+        name, value = text.split(";", 1)[0].split("=", 1)
+        name = name.strip()
+        if name in _H5_COOKIE_FIELDS and value.strip():
+            updates[name] = value.strip()
+    return updates
+
+
 def probe_cookie_verification_from_cookie(
     cookie_text: str,
     proxy: Optional[Dict[str, Any]] = None,
@@ -189,36 +249,58 @@ def probe_cookie_verification_from_cookie(
         proxy_url = f"{proxy_type}://{auth}{proxy_host}:{proxy_port}"
         proxies = {"http": proxy_url, "https": proxy_url}
 
-    device_id = generate_cookie_verification_device_id(user_id)
-    ts = str(int(time.time()) * 1000)
-    data_val = (
-        '{"appKey":"444e9908a51d1cb236a27862abc769c9",'
-        f'"deviceId":"{device_id}"'
-        "}"
-    )
-    params = {
-        "jsv": "2.7.2",
-        "appKey": "34839810",
-        "t": ts,
-        "sign": build_cookie_verification_sign(ts, token, data_val),
-        "v": "1.0",
-        "type": "originaljson",
-        "accountSite": "xianyu",
-        "dataType": "json",
-        "timeout": "20000",
-        "api": "mtop.taobao.idlemessage.pc.login.token",
-        "sessionOption": "AutoLoginOnly",
-        "spm_cnt": "a21ybx.im.0.0",
-    }
-    response = session.post(
-        "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/",
-        params=params,
-        data={"data": data_val},
-        proxies=proxies,
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    def post_once(active_cookies: Dict[str, str]):
+        sign_token = str(active_cookies.get("_m_h5_tk") or "").split("_")[0]
+        device_id = generate_cookie_verification_device_id(user_id)
+        ts = str(int(time.time()) * 1000)
+        data_val = (
+            '{"appKey":"444e9908a51d1cb236a27862abc769c9",'
+            f'"deviceId":"{device_id}"'
+            "}"
+        )
+        params = {
+            "jsv": "2.7.2",
+            "appKey": "34839810",
+            "t": ts,
+            "sign": build_cookie_verification_sign(ts, sign_token, data_val),
+            "v": "1.0",
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": "mtop.taobao.idlemessage.pc.login.token",
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": "a21ybx.im.0.0",
+        }
+        response = session.post(
+            "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/",
+            params=params,
+            data={"data": data_val},
+            proxies=proxies,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        try:
+            jar = dict(session.cookies.get_dict())
+        except Exception:
+            jar = dict(active_cookies)
+        jar.update(_h5_updates_from_response(response, jar))
+        return body, jar
+
+    payload, session_cookies = post_once(cookies)
+    original_h5 = str(cookies.get("_m_h5_tk") or "")
+    refreshed_h5 = str(session_cookies.get("_m_h5_tk") or "")
+    h5_token_refreshed = False
+    if payload_is_h5_token_expired(payload) and refreshed_h5 and refreshed_h5 != original_h5:
+        cookies["_m_h5_tk"] = refreshed_h5
+        refreshed_enc = str(session_cookies.get("_m_h5_tk_enc") or "").strip()
+        if refreshed_enc:
+            cookies["_m_h5_tk_enc"] = refreshed_enc
+        session.cookies.update(cookies)
+        payload, session_cookies = post_once(cookies)
+        h5_token_refreshed = True
+
     data_payload = payload.get("data") or {}
     verification_url = str(data_payload.get("url") or "").strip() or None
     ret_value = payload.get("ret") or []
@@ -234,12 +316,6 @@ def probe_cookie_verification_from_cookie(
     elif success_ret and has_token_payload:
         status = "cookie_valid"
 
-    session_cookies = {}
-    try:
-        session_cookies = dict(session.cookies.get_dict())
-    except Exception:
-        session_cookies = dict(cookies)
-
     return {
         "status": status,
         "verification_url": verification_url,
@@ -247,6 +323,9 @@ def probe_cookie_verification_from_cookie(
         "session_cookies": session_cookies,
         "success_ret": success_ret,
         "has_token_payload": has_token_payload,
+        "h5_token_refreshed": h5_token_refreshed,
+        "h5_token_expired": payload_is_h5_token_expired(payload),
+        "cookie_text": merge_h5_cookie_text(cookie_text, session_cookies),
     }
 
 

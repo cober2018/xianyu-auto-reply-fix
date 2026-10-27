@@ -6551,6 +6551,13 @@ async def _prepare_qr_token_prewarm(account_id: str, cookies: str, proxy=None, n
         logger.warning(f"扫码Token预热异常，改为延迟首次预检: {account_id}")
         XianyuLive.defer_initial_token_preflight(account_id, settle)
         return outcome
+    if probe.get("h5_token_refreshed") and probe.get("cookies_str"):
+        try:
+            persisted = XianyuLive.persist_refreshed_h5_cookie(account_id, probe["cookies_str"]) or ""
+        except Exception:
+            persisted = ""
+        if persisted:
+            outcome["cookies_str"] = persisted
     if probe.get("platform_punish"):
         XianyuLive.persist_token_recovery_hold(account_id, reason="platform_punish")
         outcome["platform_punish"] = True
@@ -6744,6 +6751,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     platform_punish = bool(prewarm.get('platform_punish'))
                     if prewarm.get('warning_message'):
                         warning_message = prewarm['warning_message']
+                    final_cookies = prewarm.get('cookies_str') or final_cookies
 
                     try:
                         if cookie_manager.manager:
@@ -6934,6 +6942,7 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
             raise RuntimeError("扫码 Cookie 保存失败，未启动聊天恢复")
 
         prewarm = await _prepare_qr_token_prewarm(account_id, cookies)
+        cookies = prewarm.get('cookies_str') or cookies
         # 添加到或更新cookie_manager：降级保存同样走统一热重载（清退避→切换→二次清退避→登记补发巡检）
         if cookie_manager.manager:
             await _hot_reload_after_qr_success(
@@ -7056,9 +7065,10 @@ async def refresh_cookies_from_qr_login(
                     )
                     token_prewarmed = bool(prewarm.get('token_prewarmed'))
                     punish_message = prewarm.get('warning_message')
+                    reload_cookies = prewarm.get('cookies_str') or updated_cookie_info['cookies_str']
                     await _hot_reload_after_qr_success(
                         cookie_id,
-                        updated_cookie_info['cookies_str'],
+                        reload_cookies,
                         is_new_account=False,
                         current_user=current_user,
                         authorize_handoff=bool(prewarm.get('authorize_handoff', True)),

@@ -142,6 +142,8 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'token_recovery_hold_seconds': 21600,
     # 扫码后没有预热到 Token 时，首轮预检前的落库稳定等待
     'token_preflight_settle_seconds': 5,
+    # 扫码稳定期结束后，预检失败最多再试这么多次；成功才记完成
+    'token_recovery_grace_recheck_max_attempts': 3,
     'max_post_slider_session_retries': 1,
     'soft_auth_token_preflight_enabled': True,
     'soft_auth_token_preflight_timeout_seconds': 5.0,

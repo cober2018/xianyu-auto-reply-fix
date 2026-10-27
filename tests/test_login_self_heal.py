@@ -182,6 +182,26 @@ class ChatFlagIdentityTests(unittest.TestCase):
         self.assertFalse(self.store.set_chat_verification_required("heal-acc", True, expected_cookie=OTHER_COOKIE2))
         self.assertTrue(self.store.get_chat_verification_required("heal-acc"))
 
+    def test_grace_recheck_failures_reset_when_new_scan_starts(self):
+        self.assertTrue(self.store.save_cookie("heal-acc", STORED))
+        self.assertEqual(
+            self.store.record_token_recovery_grace_recheck_failure("heal-acc", "h5_token_expired"),
+            1,
+        )
+        self.assertEqual(
+            self.store.record_token_recovery_grace_recheck_failure("heal-acc", "h5_token_expired"),
+            2,
+        )
+        budget = self.store.get_token_recovery_budget("heal-acc")
+        self.assertEqual(budget["grace_recheck_failures"], 2)
+        self.assertEqual(budget["grace_recheck_reason"], "h5_token_expired")
+        self.assertEqual(budget["grace_rechecked"], 0)
+        self.assertTrue(self.store.set_cookie_qr_login_grace_until("heal-acc", int(time.time()) + 600))
+        budget = self.store.get_token_recovery_budget("heal-acc")
+        self.assertEqual(budget["grace_recheck_failures"], 0)
+        self.assertEqual(budget["grace_recheck_reason"], "")
+        self.assertEqual(budget["grace_rechecked"], 0)
+
 
 class QrPrewarmTests(unittest.TestCase):
     def tearDown(self):
@@ -232,6 +252,139 @@ class QrPrewarmTests(unittest.TestCase):
         self.assertTrue(result["platform_punish"])
         self.assertIsNone(result["token"])
         self.assertNotIn("prewarm-acc", XianyuLive._auth_prewarmed_tokens)
+
+
+class GraceRecheckTests(unittest.TestCase):
+    def tearDown(self):
+        XianyuLive._auth_prewarmed_tokens.pop("grace-acc", None)
+
+    def test_plain_token_expiry_is_not_account_punish(self):
+        self.assertFalse(XianyuLive.response_is_platform_punish("FAIL_SYS_TOKEN_EXOIRED::令牌过期"))
+        self.assertFalse(XianyuLive.response_is_platform_punish({"ret": ["FAIL_SYS_TOKEN_EXPIRED::令牌过期"]}))
+        self.assertTrue(XianyuLive.response_is_h5_token_expired("FAIL_SYS_TOKEN_EXOIRED::令牌过期"))
+        self.assertTrue(XianyuLive.response_is_platform_punish("RGV587_ERROR"))
+
+    def _grace_live(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "grace-acc"
+        live.cookies_str = STORED
+        live.proxy_config = None
+        live.chat_verification_required = True
+        live._get_qr_login_grace_remaining_seconds = lambda: 0
+        live.send_token_refresh_notification = mock.AsyncMock()
+        return live
+
+    def test_stuck_recheck_flag_still_retries_then_second_success_clears(self):
+        live = self._grace_live()
+        budget = {
+            "attempts": 0,
+            "hold_until": 0,
+            "hold_reason": "",
+            "grace_rechecked": 1,
+            "grace_recheck_failures": 0,
+            "grace_recheck_reason": "",
+        }
+        chat_flag = {"value": True}
+        marked = {"done": False}
+        probes = [
+            {
+                "cached": False,
+                "status": "unknown",
+                "platform_punish": False,
+                "h5_token_expired": True,
+                "h5_token_refreshed": False,
+                "cookies_str": STORED,
+                "token": None,
+            },
+            {
+                "cached": True,
+                "status": "cookie_valid",
+                "platform_punish": False,
+                "h5_token_expired": False,
+                "h5_token_refreshed": False,
+                "cookies_str": STORED,
+                "token": "access-1",
+            },
+        ]
+
+        def get_flag(_cookie_id):
+            return chat_flag["value"]
+
+        def set_flag(_cookie_id, required, expected_cookie=None):
+            if expected_cookie != live.cookies_str:
+                return False
+            chat_flag["value"] = bool(required)
+            return True
+
+        def get_budget(_cookie_id):
+            return dict(budget)
+
+        def record_failure(_cookie_id, reason=""):
+            budget["grace_recheck_failures"] += 1
+            budget["grace_recheck_reason"] = reason
+            return budget["grace_recheck_failures"]
+
+        def clear_budget(_cookie_id):
+            budget["attempts"] = 0
+            budget["hold_until"] = 0
+            budget["hold_reason"] = ""
+            budget["grace_recheck_failures"] = 0
+            return True
+
+        def mark(_cookie_id):
+            marked["done"] = True
+            budget["grace_rechecked"] = 1
+            return True
+
+        async def prewarm(*_args, **_kwargs):
+            return probes.pop(0)
+
+        async def run():
+            await live._maybe_recheck_token_after_qr_grace()
+            self.assertTrue(chat_flag["value"])
+            self.assertEqual(budget["grace_recheck_failures"], 1)
+            self.assertEqual(budget["grace_recheck_reason"], "h5_token_expired")
+            self.assertFalse(marked["done"])
+            await live._maybe_recheck_token_after_qr_grace()
+
+        with mock.patch("XianyuAutoAsync.db_manager.get_chat_verification_required", get_flag), \
+                mock.patch("XianyuAutoAsync.db_manager.set_chat_verification_required", set_flag), \
+                mock.patch("XianyuAutoAsync.db_manager.get_token_recovery_budget", get_budget), \
+                mock.patch("XianyuAutoAsync.db_manager.record_token_recovery_grace_recheck_failure", record_failure), \
+                mock.patch("XianyuAutoAsync.db_manager.clear_token_recovery_budget", clear_budget), \
+                mock.patch("XianyuAutoAsync.db_manager.mark_token_recovery_grace_rechecked", mark), \
+                mock.patch.object(XianyuLive, "prewarm_token_from_cookie", prewarm):
+            asyncio.run(run())
+
+        self.assertFalse(chat_flag["value"])
+        self.assertFalse(live.chat_verification_required)
+        self.assertEqual(live.current_token, "access-1")
+        self.assertEqual(live.last_token_refresh_status, "success")
+        self.assertTrue(marked["done"])
+        self.assertNotIn("grace-acc", XianyuLive._auth_prewarmed_tokens)
+
+    def test_recheck_stops_after_failure_cap(self):
+        live = self._grace_live()
+        budget = {
+            "attempts": 0,
+            "hold_until": 0,
+            "hold_reason": "",
+            "grace_rechecked": 0,
+            "grace_recheck_failures": 3,
+            "grace_recheck_reason": "h5_token_expired",
+        }
+
+        async def prewarm(*_args, **_kwargs):
+            raise AssertionError("已达失败上限，不应再预检")
+
+        async def run():
+            await live._maybe_recheck_token_after_qr_grace()
+
+        with mock.patch("XianyuAutoAsync.db_manager.get_chat_verification_required", return_value=True), \
+                mock.patch("XianyuAutoAsync.db_manager.get_token_recovery_budget", return_value=budget), \
+                mock.patch.object(XianyuLive, "prewarm_token_from_cookie", prewarm):
+            asyncio.run(run())
+        self.assertTrue(live.chat_verification_required)
 
 
 class HealthGradeTests(unittest.TestCase):

@@ -87,6 +87,8 @@ RISK_CONTROL:
   token_recovery_hold_seconds: 21600
   # 扫码成功但没预热到 Token 时，新实例首次预检前等待秒数
   token_preflight_settle_seconds: 5
+  # 扫码稳定期结束后预检失败的重试上限；只有成功才记完成，避免一次令牌过期把复查用掉
+  token_recovery_grace_recheck_max_attempts: 3
   # 拟人化：付款到自动发货之间的随机延迟区间(秒)，秒发是机器人签名
   auto_delivery_delay_range: [20, 90]
   # 拟人化：夜间窗口内发货延迟拉长(秒)，真人卖家凌晨处理更慢
